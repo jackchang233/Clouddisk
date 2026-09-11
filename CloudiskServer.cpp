@@ -1,0 +1,769 @@
+#include <workflow/MySQLResult.h>
+#include <workflow/WFTaskFactory.h>
+#include <workflow/MySQLUtil.h>
+#include <wfrest/PathUtil.h>
+#include <wfrest/CodeUtil.h>
+#include <vector>
+#include <string>
+#include <functional>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <SimpleAmqpClient/SimpleAmqpClient.h>
+#include <nlohmann/json.hpp>
+#include "CloudiskServer.h"
+#include "CryptoUtil.h"
+#include "ErrorUtil.h"
+#include "ValidatorUtil.h"
+#include "OSSManager.h"
+
+using namespace std;
+using namespace wfrest;
+using namespace protocol;
+using namespace std::placeholders;
+using namespace AmqpClient;
+
+
+static const string MYSQL_URL = "mysql://root:123456@localhost:3306/test";
+static const string RABBITMQ_URL = "amqp://guest:guest@localhost:5672/%2f";
+static const string OSS_BUCKET = "netdisk74147";
+static const int RETRY_MAX = 3;
+
+// 回收站清理策略: 软删超过 7 天彻底删除, 每小时扫一次
+static const int RECYCLE_EXPIRE_DAYS = 7;
+static const time_t RECYCLE_SWEEP_INTERVAL = 3600;
+
+// RFC 5987: HTTP 头部值只允许可见 ASCII，中文文件名必须百分号编码
+// 否则裸 UTF-8 字节进响应头，curl 能容忍但 Chrome 会判响应非法 (ERR_INVALID_RESPONSE)
+static string percent_encode(const string& s){
+    static const char* HEX = "0123456789ABCDEF";
+    string out;
+    for (unsigned char c : s) {
+        if (c > 0x20 && c < 0x7F && c != '"' && c != '%') {
+            out += c;
+        } else {
+            out += '%';
+            out += HEX[c >> 4];
+            out += HEX[c & 0xF];
+        }
+    }
+    return out;
+}
+
+// 转义并包上单引号，得到安全的 SQL 字符串字面量 (防注入)
+// 注意用 escape_string (反斜杠转义) 而非 escape_string_quote (引号翻倍, 仅 NO_BACKSLASH_ESCAPES 模式适用)
+static string sql_quote(const string& s){
+    return "'" + MySQLUtil::escape_string(s) + "'";
+}
+
+void CloudiskServer::register_modules()
+{
+    // 设置静态资源的路由
+    register_static_resources_module();
+    register_signup_module();
+    register_signin_module();
+    register_userinfo_module();
+    register_fileupload_module();
+    register_filelist_module();
+    register_filedownload_module();
+    register_filedelete_module();
+    register_recycle_module();
+}
+
+void CloudiskServer::register_static_resources_module()
+{
+    m_server.GET("/user/signup", [](const HttpReq *, HttpResp * resp){
+        resp->Redirect("/spa/index.html", HttpStatusMovedPermanently);
+    });
+
+    // Vue SPA (Element Plus 版前端, 构建产物在 static/spa/, hash 路由)
+    m_server.GET("/spa", [](const HttpReq *, HttpResp * resp){
+        resp->Redirect("/spa/index.html", HttpStatusMovedPermanently);
+    });
+    m_server.GET("/spa/", [](const HttpReq *, HttpResp * resp){
+        resp->Redirect("/spa/index.html", HttpStatusMovedPermanently);
+    });
+    m_server.Static("/spa", "static/spa");
+
+    // 头像 (新 SPA 侧栏使用)
+    m_server.GET("/static/img/avatar.jpeg", [](const HttpReq *, HttpResp * resp){
+        resp->File("static/img/avatar.jpeg");
+    });
+}
+
+/*********************************************************************************
+ *                               注册                                            *
+ *********************************************************************************/
+
+void CloudiskServer::register_signup_module()
+{
+    m_server.POST("/user/signup", [](const HttpReq* req, HttpResp* resp)
+    {
+        // TODO: 校验请求的Content-Type，不是APPLICATION_URLENCODED则返回400 Bad Request
+        if(req->content_type() != APPLICATION_URLENCODED){
+            ErrorUtil::send_error(resp, 400);
+            return;
+        }
+        // 1. 解析表单数据(application/x-www-form-urlencoded)，获取用户名和密码
+        //    提示: req->form_kv() 返回 map<string, string>&，键为"username"和"password"
+        map<string, string>& data = req->form_kv();
+        string& username = data["username"];
+        string& password = data["password"];
+        // 2. 校验用户名和密码(用户名是否在黑名单内，密码是否符合强度要求...)
+        // 这些校验可能前端也会做 (提升用户体验)
+        // 但是后端永远不要相信前端传过来的数据 (因为很容易绕过前端，直接给后端发发送请求，比如用 curl)
+#ifdef DEBUG
+        cout << "[INFO] username: " << username << ", password: " << password << endl; /* 调试信息 */
+#endif
+        if (username == "" || password == "") {
+            ErrorUtil::send_error(resp, 400);
+            return ;
+        }
+        // 格式合法性校验 (仅注册强制: 理由见 ValidatorUtil.h)
+        string invalid_reason = ValidatorUtil::validate_username(username);
+        if (invalid_reason.empty())
+            invalid_reason = ValidatorUtil::validate_password(password);
+        if (!invalid_reason.empty()) {
+            ErrorUtil::send_error(resp, 400, invalid_reason);
+            return ;
+        }
+        // 3. 校验通过后，创建MySQL任务，将用户名和密码插入到MySQL数据库
+        //    提示: CryptoUtil::generate_salt() 生成盐值
+        //          CryptoUtil::hash_password(password, salt) 计算哈希
+        //          INSERT INTO tbl_user (username, password, salt) VALUES (...)
+        //          resp->MySQL(MYSQL_URL, sql, 回调): 失败返回500，成功返回"SUCCESS"
+        string salt = CryptoUtil::generate_salt();
+        string hashcode = CryptoUtil::hash_password(password, salt);
+        string sql = "INSERT INTO tbl_user (username, password, salt) VALUES ("
+            + sql_quote(username) + ", "
+            + sql_quote(hashcode) + ", "
+            + sql_quote(salt) + ")";
+        cout << "[SQL] " << sql << endl;   /* 日志 */
+
+        resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+        {
+            if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {;
+                ErrorUtil::send_error(resp, 500);
+                return ;
+            }    
+            resp->String("SUCCESS");
+        });
+    });
+}
+
+
+/*********************************************************************************
+ *                               登录                                            *
+ *********************************************************************************/
+void signin_callback(HttpResp* resp, string password, WFMySQLTask* task)
+{
+    if(task->get_state() != WFT_STATE_SUCCESS){
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    /* MySQL任务失败
+       提示: task->get_state() != WFT_STATE_SUCCESS 或
+             task->get_resp()->get_packet_type() == MYSQL_PACKET_ERROR 时返回500 */
+    MySQLResultCursor cursor = task->get_resp();
+    std::vector<MySQLCell> record; 
+    // MySQL任务执行成功
+    // TODO: 用 task->get_resp() 构造 MySQLResultCursor，fetch_row 取出记录
+    //       空结果集 => 用户不存在，返回400 "用户名或密码错误"
+    if(!cursor.fetch_row(record)){
+        ErrorUtil::send_error(resp, 400, "用户名或密码错误");
+        return;
+    }
+    // TODO: 将记录字段 (id/username/hashcode/salt/createdAt) 填入 User 结构体
+    User user;
+    user.id=record[0].as_int();
+    user.username=record[1].as_string();
+    user.hashcode = record[2].as_string();
+    user.salt = record[3].as_string();
+    user.createdAt = record[4].as_datetime();
+#ifdef DEBUG
+    cout << "User{ id: " << user.id
+        << ", username: " << user.username
+        << ", hashcode: " << user.hashcode
+        << ", salt: " << user.salt
+        << ", createdAt: " << user.createdAt << " }" << endl;
+#endif
+    string hashcode1 = CryptoUtil::hash_password(password, user.salt);
+#ifdef DEBUG
+    std::cout << "generated hashcode: " << hashcode1 << "\n";
+#endif
+    if (hashcode1 == user.hashcode) {
+        nlohmann::json data;
+        data["Token"] = CryptoUtil::generate_token(user);
+        data["Username"] = user.username;
+        data["Location"] = "/spa/";    /* 跳转到 SPA 首页 */
+
+        nlohmann::json json;
+        json["data"] = data;
+        resp->String(json.dump(2));
+        return ;
+    }
+    // 密码错误
+    ErrorUtil::send_error(resp, 400, "用户名或密码错误");
+    return;
+    // TODO: CryptoUtil::hash_password(password, user.salt) 与库中hashcode比对
+    //       一致 => CryptoUtil::generate_token(user) 生成Token，
+    //               组装json { data: {Token, Username, Location} } 返回
+    //       不一致 => 返回400 "用户名或密码错误"
+}
+
+void CloudiskServer::register_signin_module()
+{
+    // 精确路由
+    m_server.POST("/user/signin", [](const HttpReq* req, HttpResp* resp, SeriesWork* series)
+    {
+        if(req->content_type() != APPLICATION_URLENCODED){
+            ErrorUtil::send_error(resp, 400);
+            return;
+        }
+        // TODO: 1. 校验Content-Type、解析表单、校验用户名密码非空 (同signup)
+        map<string, string>& data = req->form_kv();
+        string& username = data["username"];
+        string& password = data["password"];
+#ifdef DEBUG
+        cout << "[INFO] username: " << username << ", password: " << password << endl; /* 调试信息 */
+#endif
+        if (username == "" || password == "") {
+            ErrorUtil::send_error(resp, 400);
+            return ;
+        }
+        // TODO: 2. 构建SQL: SELECT * FROM tbl_user WHERE username='...' AND tomb=0
+        string sql = "SELECT * FROM tbl_user WHERE username = "
+            + sql_quote(username) + " AND tomb = 0";
+        cout<< "[SQL]" << sql << endl;
+        // TODO: 3. WFTaskFactory::create_mysql_task(MYSQL_URL, RETRY_MAX, 回调) 创建任务
+        //          回调用 std::bind 绑定 signin_callback(resp, password, _1)
+        //          task->get_req()->set_query(sql) 设置SQL
+        //          series->push_back(task) 提交任务
+        WFMySQLTask* task = WFTaskFactory::create_mysql_task(
+            MYSQL_URL,
+            RETRY_MAX,
+            std::bind(signin_callback,resp,password,_1)
+        );
+        task->get_req()->set_query(sql);
+        series->push_back(task);
+    });
+}
+
+
+/*********************************************************************************
+ *                               用户信息                                        *
+ *********************************************************************************/
+void CloudiskServer::register_userinfo_module()
+{
+    m_server.GET("/user/info", [](const HttpReq* req, HttpResp* resp)
+    {
+        string username = req->query("username");
+        string token = req->query("token");
+#ifdef DEBUG
+        cout << "username: " << username
+            << "token: " << token << endl;
+#endif
+        // 校验Token
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        nlohmann::json data;
+        data["Username"] = user.username;
+        data["SignupAt"] = user.createdAt;
+
+        nlohmann::json json;
+        json["data"] = data;
+        resp->String(json.dump(2));
+    });
+}
+
+/*********************************************************************************
+ *                               上传文件                                        *
+ *********************************************************************************/
+
+void CloudiskServer::register_fileupload_module()
+{
+    m_server.POST("/file/upload", [](const HttpReq* req, HttpResp* resp)
+    {
+        string username = req->query("username");
+        string token = req->query("token");
+        // 2. 校验token
+        User user{};
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+        // TODO: 3. 校验Content-Type: 必须是MULTIPART_FORM_DATA，否则返回400
+        if(req->content_type() != MULTIPART_FORM_DATA){
+            ErrorUtil::send_error(resp, 400);
+            return;
+        }
+        // TODO: 4. 处理文件: 遍历 req->form()
+        //          (Form = map<string, pair<filename, content>>，用结构化绑定取出)
+        //          - CryptoUtil::generate_hashcode 计算文件哈希
+        //          - 为每个用户单独创建文件夹 files/<username>/
+        //            (access + F_OK 判断是否存在，不存在则 mkdir)
+        //          - open(O_WRONLY|O_CREAT|O_TRUNC) / write / close 写入文件
+        //          - [OSS备份]
+        
+        Form& form = req->form();
+        for (const auto& [_,file] : form){
+            const auto& [filename,content] = file;
+            string hashcode = CryptoUtil::generate_hashcode(content.c_str(),content.size());
+            string directory = "files/" + username +"/";
+            if(access(directory.c_str(),F_OK)){
+                mkdir(directory.c_str(),0777);
+            }
+            string filepath = directory + PathUtil::base(filename);
+#ifdef DEBUG
+            cout << "filepath: " << filepath << endl;
+#endif
+            int fd = open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd < 0) {
+                ErrorUtil::send_error(resp, 500);
+                return ;
+            }
+            // 写入文件
+            write(fd, content.c_str(), content.size());
+            close(fd);
+
+            // [OSS备份]: 异步备份，往消息队列中写入一条消息
+            // 消息体对齐消费者的 OSSManager::upload_file(bucket, object, file)
+            Channel::ptr_t channel = Channel::CreateFromUri(RABBITMQ_URL);
+            nlohmann::json obj;
+            obj["bucket"]   = OSS_BUCKET;
+            obj["object"]   = std::to_string(user.id) + "/" + hashcode;
+            obj["file"]     = filepath;
+            obj["uid"]      = user.id;
+            obj["filename"] = filename;
+            obj["hashcode"] = hashcode;
+            obj["size"]     = content.size();
+            BasicMessage::ptr_t message = BasicMessage::Create(obj.dump());
+            // 发送消息 (交换机/队列/绑定已由 RabbitMQ 侧配置完成)
+            string exchange = "ossbackup";
+            string routingKey = "oss";
+            channel->BasicPublish(exchange, routingKey, message);
+            // 写`tbl_file`表
+            string sql = "REPLACE INTO tbl_file (uid, filename, hashcode, size) VALUES ("
+                + std::to_string(user.id) + ", "
+                + sql_quote(filename) + ", "
+                + sql_quote(hashcode) + ", "
+                + std::to_string(content.size()) + ")";
+
+            cout << "[SQL] " << sql << endl;
+
+            resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+            {
+                if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+                    ErrorUtil::send_error(resp, 500);
+                    return ;
+                }
+                resp->String(R"({"code":0,"msg":"SUCCESS"})");
+            });
+        }
+    });
+}
+
+
+/*********************************************************************************
+ *                               文件列表                                        *
+ *********************************************************************************/
+void filelist_callback(HttpResp* resp, MySQLResultCursor* cursor)
+{
+    if(cursor->get_cursor_status()!= MYSQL_STATUS_GET_RESULT){
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    /* MySQL任务失败
+       提示: cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT 时返回500 */
+
+    /* 任务执行成功 */
+    vector <MySQLCell> record;
+    nlohmann::json result = nlohmann::json::array();
+    while(cursor->fetch_row(record)){
+        nlohmann::json file;
+        file["Id"] = record[0].as_int();
+        file["FileName"] = record[1].as_string();
+        file["FileHash"] = record[2].as_string();
+        file["FileSize"] = record[3].as_ulonglong();
+        file["UploadAt"] = record[4].as_datetime();
+        file["LastUpdated"] = record[5].as_datetime();
+        result.push_back(std::move(file));
+    }
+    resp->String(result.dump(2));
+}
+
+void CloudiskServer::register_filelist_module()
+{
+    m_server.POST("/file/query", [](const HttpReq* req, HttpResp* resp)
+    {
+        // TODO: 1. 解析请求: query中的username/token，表单中的limit (req->form_kv()["limit"])
+        string username = req -> query("username");
+        string token = req->query("token");
+        string limit = req ->form_kv()["limit"];
+        // LIMIT 只接受非负整数: 白名单校验，非法或缺失则回落默认值
+        if (limit.empty() || limit.find_first_not_of("0123456789") != string::npos)
+            limit = "5";
+        // TODO: 2. 校验Token: 失败返回401 Unauthorized
+#ifdef DEBUG
+        cout << "username: " << username
+            << ", token: " << token
+            << ", limit: " << limit << endl;
+#endif
+        // 3. 校验Token
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+        // TODO: 3. 构建SQL: SELECT filename, hashcode, size, created_at, last_update
+        //          FROM tbl_file WHERE uid=<user.id> LIMIT <limit>
+        //          通过 resp->MySQL(MYSQL_URL, sql, 回调) 执行，
+        //          回调用 std::bind 绑定 filelist_callback(resp, _1)
+        string sql = "SELECT id, filename, hashcode, size, created_at, last_update FROM tbl_file WHERE uid="
+        + std::to_string(user.id)+ " AND status = 0 LIMIT " + limit;
+
+        cout << "[SQL] " << sql << endl;
+
+        resp->MySQL(
+            MYSQL_URL,
+            sql,
+            std::bind(filelist_callback, resp, _1)
+        );
+    });
+}
+
+/*********************************************************************************
+ *                               下载文件                                        *
+ *********************************************************************************/
+// 下载回调: 查库确认文件存在且未被软删后才真正下发文件
+void download_callback(HttpResp* resp, string filepath, string filename, MySQLResultCursor* cursor)
+{
+    if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    vector<MySQLCell> record;
+    if (!cursor->fetch_row(record)) {
+        // 文件不存在或已被删除
+        ErrorUtil::send_error(resp, 404, "文件不存在或已删除");
+        return;
+    }
+    // 双写兼容: filename* (RFC 5987) 是现代浏览器优先读取的标准写法，
+    // filename 作为旧客户端回退。两者都必须是纯 ASCII
+    string fname = percent_encode(PathUtil::base(filename));
+    resp->set_header_pair("Content-Disposition",
+        "attachment; filename=\"" + fname + "\"; filename*=UTF-8''" + fname);
+    resp->File(filepath);
+}
+
+void CloudiskServer::register_filedownload_module()
+{
+    m_server.GET("/file/download", [](const HttpReq* req, HttpResp* resp)
+    {
+        // TODO: 1. 获取请求参数: query中的filename/filehash/username/token
+        // wfrest 不解码 query 参数: 浏览器发来的 %E8%AE%BE... 需手动还原成 UTF-8
+        string filename = CodeUtil::url_decode(req->query("filename"));
+        string filehash = req->query("filehash");
+        string username = req -> query("username");
+        string token = req->query("token");
+        // TODO: 2. 校验Token: 失败返回401 Unauthorized
+#ifdef DEBUG
+        cout << "filename: " << filename
+            <<", filehash: " <<filehash
+            <<", username: " <<username
+            << ", token: " << token<< endl;
+
+#endif
+        // 3. 校验Token
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        string filepath = "files/" + user.username + "/" + PathUtil::base(filename);
+#ifdef DEBUG
+        cout << "filepath: " << filepath << endl;
+#endif
+        // 下载前查库: 确认该文件属于当前用户且未被软删 (status=0)，否则 404
+        // 注意: escape_string_quote 只转义不加引号，外层单引号需自己补
+        string sql = "SELECT filename FROM tbl_file WHERE uid = " + std::to_string(user.id)
+            + " AND filename = '" + MySQLUtil::escape_string_quote(filename, '\'') + "'"
+            + " AND status = 0";
+
+        resp->MySQL(MYSQL_URL, sql, std::bind(download_callback, resp, filepath, filename, _1));
+    });
+}
+
+/*********************************************************************************
+ *                               删除文件(软删)                                  *
+ *********************************************************************************/
+// 软删回调: 只把 status 置 1，物理文件保留 (回收站恢复需要)
+void delete_callback(HttpResp* resp, string id_str, int uid, MySQLResultCursor* cursor)
+{
+    if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    vector<MySQLCell> record;
+    if (!cursor->fetch_row(record)) {
+        ErrorUtil::send_error(resp, 404, "文件不存在或已删除");
+        return;
+    }
+
+    // 软删: 只改 status 并记录删除时间，行和物理文件都保留，可进回收站、可恢复
+    string sql = "UPDATE tbl_file SET status = 1, deleted_at = NOW() WHERE id = " + id_str
+        + " AND uid = " + std::to_string(uid);
+
+    resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+    {
+        if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+            ErrorUtil::send_error(resp, 500);
+            return;
+        }
+        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+    });
+}
+
+void CloudiskServer::register_filedelete_module()
+{
+    m_server.POST("/file/delete", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        string id_str = req->form_kv()["id"];
+
+        // 校验Token
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return;
+        }
+        // id 必须是纯数字
+        if (id_str.empty() || id_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的文件ID");
+            return;
+        }
+
+        // 先查文件名(校验归属 uid + 未删除 status=0)，拿不到就 404
+        string sql = "SELECT filename FROM tbl_file WHERE id = " + id_str
+            + " AND uid = " + std::to_string(user.id) + " AND status = 0";
+
+        resp->MySQL(MYSQL_URL, sql, std::bind(delete_callback, resp, id_str, user.id, _1));
+    });
+}
+
+/*********************************************************************************
+ *                               回收站                                           *
+ *********************************************************************************/
+// 恢复回调: status 置回 0 (软删时物理文件未删，直接恢复即可用)
+void restore_callback(HttpResp* resp, string id_str, int uid, MySQLResultCursor* cursor)
+{
+    if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    vector<MySQLCell> record;
+    if (!cursor->fetch_row(record)) {
+        ErrorUtil::send_error(resp, 404, "文件不存在");
+        return;
+    }
+
+    string sql = "UPDATE tbl_file SET status = 0, deleted_at = NULL WHERE id = " + id_str
+        + " AND uid = " + std::to_string(uid);
+
+    resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+    {
+        if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+            ErrorUtil::send_error(resp, 500);
+            return;
+        }
+        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+    });
+}
+
+// 彻底删除回调: 删行 + 删物理文件 (不可恢复)
+void purge_callback(HttpResp* resp, string directory, string id_str, int uid, MySQLResultCursor* cursor)
+{
+    if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    vector<MySQLCell> record;
+    if (!cursor->fetch_row(record)) {
+        ErrorUtil::send_error(resp, 404, "文件不存在");
+        return;
+    }
+    string filename = record[0].as_string();
+    string filepath = directory + PathUtil::base(filename);
+
+    string sql = "DELETE FROM tbl_file WHERE id = " + id_str
+        + " AND uid = " + std::to_string(uid);
+
+    resp->MySQL(MYSQL_URL, sql, [resp, filepath](MySQLResultCursor* cursor)
+    {
+        if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+            ErrorUtil::send_error(resp, 500);
+            return;
+        }
+        // 删行成功后尽力删物理文件: 失败只留下孤儿文件(无害)，不阻断响应
+        if (unlink(filepath.c_str()) != 0) {
+            cout << "[WARN] 物理文件删除失败: " << filepath << endl;
+        }
+        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+    });
+}
+
+// 回收站列表回调: 输出 Id/FileName/FileSize/DeletedAt
+void recyclelist_callback(HttpResp* resp, MySQLResultCursor* cursor)
+{
+    if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+        ErrorUtil::send_error(resp, 500);
+        return;
+    }
+    vector<MySQLCell> record;
+    nlohmann::json result = nlohmann::json::array();
+    while (cursor->fetch_row(record)) {
+        nlohmann::json file;
+        file["Id"] = record[0].as_int();
+        file["FileName"] = record[1].as_string();
+        file["FileSize"] = record[2].as_ulonglong();
+        file["DeletedAt"] = record[3].as_datetime();
+        result.push_back(std::move(file));
+    }
+    resp->String(result.dump(2));
+}
+
+void CloudiskServer::register_recycle_module()
+{
+    // 回收站列表 (status=1)
+    m_server.POST("/file/recycle", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return;
+        }
+        string sql = "SELECT id, filename, size, deleted_at FROM tbl_file WHERE uid = "
+            + std::to_string(user.id) + " AND status = 1";
+
+        resp->MySQL(MYSQL_URL, sql, std::bind(recyclelist_callback, resp, _1));
+    });
+
+    // 恢复 (status 置回 0)
+    m_server.POST("/file/restore", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        string id_str = req->form_kv()["id"];
+
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return;
+        }
+        if (id_str.empty() || id_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的文件ID");
+            return;
+        }
+
+        string sql = "SELECT filename FROM tbl_file WHERE id = " + id_str
+            + " AND uid = " + std::to_string(user.id) + " AND status = 1";
+
+        resp->MySQL(MYSQL_URL, sql, std::bind(restore_callback, resp, id_str, user.id, _1));
+    });
+
+    // 彻底删除 (删行 + 删物理文件)
+    m_server.POST("/file/purge", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        string id_str = req->form_kv()["id"];
+
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return;
+        }
+        if (id_str.empty() || id_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的文件ID");
+            return;
+        }
+
+        string directory = "files/" + user.username + "/";
+        string sql = "SELECT filename FROM tbl_file WHERE id = " + id_str
+            + " AND uid = " + std::to_string(user.id) + " AND status = 1";
+
+        resp->MySQL(MYSQL_URL, sql, std::bind(purge_callback, resp, directory, id_str, user.id, _1));
+    });
+}
+
+/*********************************************************************************
+ *                    回收站自动清理 (软删超过 7 天彻底删除)                       *
+ *********************************************************************************/
+// 「先查后删」两步: SELECT 拿到 (username, filename) 用于删物理文件, 再 DELETE 删行。
+// 两步之间存在微小竞态 (SELECT 后、DELETE 前恰被恢复的文件仍会被 unlink)，
+// 学习项目可接受；生产环境需用事务或墓碑复核规避。
+static void recycle_sweep()
+{
+    // status/deleted_at 仅存在于 tbl_file，JOIN 下无歧义，无需表别名
+    string expired_cond = "status = 1 AND deleted_at < NOW() - INTERVAL "
+        + std::to_string(RECYCLE_EXPIRE_DAYS) + " DAY";
+
+    // 第一步: 查出过期记录的 username + filename
+    WFMySQLTask* query = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
+        [expired_cond](WFMySQLTask* task)
+        {
+            MySQLResultCursor cursor(task->get_resp());
+            int status = cursor.get_cursor_status();
+            if (status == MYSQL_STATUS_ERROR) {
+                cout << "[WARN] 回收站清理查询失败 (tbl_file.deleted_at 列是否已迁移?)" << endl;
+                return;
+            }
+            if (status != MYSQL_STATUS_GET_RESULT) return;
+
+            vector<MySQLCell> row;
+            vector<string> paths;
+            while (cursor.fetch_row(row)) {
+                string username = row[0].as_string();
+                string filename = row[1].as_string();
+                paths.push_back("files/" + username + "/" + PathUtil::base(filename));
+            }
+            if (paths.empty()) return;
+
+            // 第二步: 删掉所有过期行 (单条 DELETE 即可)
+            WFMySQLTask* del = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
+                [paths](WFMySQLTask* dtask)
+                {
+                    // 第三步: 删物理文件 (尽力而为, 失败留孤儿文件, 无害)
+                    for (const string& p : paths) {
+                        if (unlink(p.c_str()) != 0)
+                            cout << "[WARN] 回收站清理失败: " << p << endl;
+                    }
+                });
+            del->get_req()->set_query("DELETE FROM tbl_file WHERE " + expired_cond);
+            Workflow::create_series_work(del, nullptr)->start();
+        });
+
+    query->get_req()->set_query(
+        "SELECT u.username, f.filename FROM tbl_file f JOIN tbl_user u ON f.uid = u.id WHERE "
+        + expired_cond);
+    Workflow::create_series_work(query, nullptr)->start();
+}
+
+// 定时回调: 扫一次后重新调度下一次
+static void sweep_timer_callback(WFTimerTask* timer)
+{
+    recycle_sweep();
+    WFTimerTask* next = WFTaskFactory::create_timer_task(RECYCLE_SWEEP_INTERVAL, 0, sweep_timer_callback);
+    next->start();
+}
+
+void CloudiskServer::start_recycle_sweep()
+{
+    WFTimerTask* timer = WFTaskFactory::create_timer_task(RECYCLE_SWEEP_INTERVAL, 0, sweep_timer_callback);
+    timer->start();
+}
+
