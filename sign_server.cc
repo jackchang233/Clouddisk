@@ -9,6 +9,7 @@
 #include "CryptoUtil.h"
 #include "User.h"
 #include "SqlUtil.h"
+#include "ValidatorUtil.h"
 #include "ppconsul/agent.h"
 
 using namespace std;
@@ -42,6 +43,18 @@ public:
 	{
 		const string& username = req->username();
 		const string& password = req->password();
+
+		// 格式校验必须在这里也做一遍, 不能只依赖网关。
+		// 微服务原则是"不信任任何调用方" —— 只要有人能直连 1412 端口,
+		// 就能绕过网关的全部校验往库里写任意用户名。
+		string invalid_reason = ValidatorUtil::validate_username(username);
+		if (invalid_reason.empty())
+			invalid_reason = ValidatorUtil::validate_password(password);
+		if (!invalid_reason.empty()) {
+			resp->set_success(false);
+			resp->set_err_msg(invalid_reason);
+			return;
+		}
 
 		string salt = CryptoUtil::generate_salt();
 		string hashcode = CryptoUtil::hash_password(password, salt);
@@ -80,6 +93,14 @@ public:
 	{
 		const string& username = req->username();
 		const string& password = req->password();
+
+		// 登录侧刻意不做格式校验 (理由见 ValidatorUtil.h: 老密码必须能参与比对),
+		// 只挡空值 —— 空用户名查库没有意义。
+		if (username.empty() || password.empty()) {
+			resp->set_success(false);
+			resp->set_err_msg(ERR_LOGIN);
+			return;
+		}
 
 		// username 来自客户端，必须转义后再拼 (防 SQL 注入)
 		string sql = "SELECT * FROM tbl_user WHERE username = " + sql_quote(username)

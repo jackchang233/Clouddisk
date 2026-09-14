@@ -58,6 +58,7 @@ add_executable(sign_server
     sign_server.cc
     UserService.pb.cc
     CryptoUtil.cpp
+    ValidatorUtil.cpp        # 服务侧独立校验, 不依赖网关
 )
 
 target_include_directories(sign_server PRIVATE
