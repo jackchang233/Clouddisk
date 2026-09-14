@@ -68,6 +68,21 @@ static string rpc_err_msg(const srpc::RPCSyncContext& ctx, const UserResponse& r
     return msg.empty() ? fallback : msg;
 }
 
+// 读取表单值并解码。
+//
+// wfrest 的 form_kv() 返回**原始未解码**的值 (与 req->query() 行为一致),
+// 必须自行调用 url_decode。不解码的后果: 密码含 + % 空格 等字符时,
+// 存进数据库的是编码后的值, 而不是用户真正输入的内容。
+//
+// ⚠️ 顺序要求: 先解码, 再交给 sql_quote 转义。
+//    反序会重新引入 SQL 注入 —— 解码会把 %27 还原成引号,
+//    若在转义之后才解码, 这个引号就完全绕过了转义。
+static string form_get(const map<string, string>& kv, const string& key)
+{
+    auto it = kv.find(key);
+    return it == kv.end() ? string() : CodeUtil::url_decode(it->second);
+}
+
 /*********************************************************************************
  *                     服务发现: 后台刷新 UserService 实例表                      *
  *********************************************************************************/
@@ -180,10 +195,10 @@ void CloudiskServer::register_signup_module()
             return;
         }
         // 1. 解析表单数据(application/x-www-form-urlencoded)，获取用户名和密码
-        //    提示: req->form_kv() 返回 map<string, string>&，键为"username"和"password"
+        //    注意: form_kv() 返回原始编码值, 必须解码后再用 (见 form_get 注释)
         map<string, string>& data = req->form_kv();
-        string& username = data["username"];
-        string& password = data["password"];
+        string username = form_get(data, "username");
+        string password = form_get(data, "password");
         // 2. 校验用户名和密码(用户名是否在黑名单内，密码是否符合强度要求...)
         // 这些校验可能前端也会做 (提升用户体验)
         // 但是后端永远不要相信前端传过来的数据 (因为很容易绕过前端，直接给后端发发送请求，比如用 curl)
@@ -242,9 +257,10 @@ void CloudiskServer::register_signin_module()
             return;
         }
         // TODO: 1. 校验Content-Type、解析表单、校验用户名密码非空 (同signup)
+        //    注意: form_kv() 返回原始编码值, 必须解码后再用 (见 form_get 注释)
         map<string, string>& data = req->form_kv();
-        string& username = data["username"];
-        string& password = data["password"];
+        string username = form_get(data, "username");
+        string password = form_get(data, "password");
 #ifdef DEBUG
         cout << "[INFO] username: " << username << ", password: " << password << endl; /* 调试信息 */
 #endif
@@ -438,7 +454,7 @@ void CloudiskServer::register_filelist_module()
         // TODO: 1. 解析请求: query中的username/token，表单中的limit (req->form_kv()["limit"])
         string username = req -> query("username");
         string token = req->query("token");
-        string limit = req ->form_kv()["limit"];
+        string limit = form_get(req->form_kv(), "limit");
         // LIMIT 只接受非负整数: 白名单校验，非法或缺失则回落默认值
         if (limit.empty() || limit.find_first_not_of("0123456789") != string::npos)
             limit = "5";
@@ -569,7 +585,7 @@ void CloudiskServer::register_filedelete_module()
     m_server.POST("/file/delete", [](const HttpReq* req, HttpResp* resp)
     {
         string token = req->query("token");
-        string id_str = req->form_kv()["id"];
+        string id_str = form_get(req->form_kv(), "id");
 
         // 校验Token
         User user;
@@ -693,7 +709,7 @@ void CloudiskServer::register_recycle_module()
     m_server.POST("/file/restore", [](const HttpReq* req, HttpResp* resp)
     {
         string token = req->query("token");
-        string id_str = req->form_kv()["id"];
+        string id_str = form_get(req->form_kv(), "id");
 
         User user;
         if (!CryptoUtil::verify_token(token, user)) {
@@ -715,7 +731,7 @@ void CloudiskServer::register_recycle_module()
     m_server.POST("/file/purge", [](const HttpReq* req, HttpResp* resp)
     {
         string token = req->query("token");
-        string id_str = req->form_kv()["id"];
+        string id_str = form_get(req->form_kv(), "id");
 
         User user;
         if (!CryptoUtil::verify_token(token, user)) {
