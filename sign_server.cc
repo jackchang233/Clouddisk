@@ -144,6 +144,35 @@ private:
 		resp->set_token(CryptoUtil::generate_token(user));
 	}
 };
+
+// 服务注册参数集中在这里, 注册与重注册共用
+static const char* const SERVICE_ID   = "UserService1";
+static const char* const SERVICE_NAME = "UserService";
+static const char* const CONSUL_ADDR  = "http://127.0.0.1:8500";
+static const int         HEARTBEAT_SEC = 9;
+// TTL 必须显著大于心跳周期, 否则调度抖动会让检查在 passing/critical 之间抖动。
+// (原来是 TTL 10s / 心跳 9s, 只有 1s 余量, 实测会 flapping)
+static const int         TTL_SEC       = 30;
+static unsigned short    g_port = 1412;
+static bool              g_registered = false;
+
+// 注册(或重新注册)到 Consul。失败抛异常, 由调用方决定如何处理。
+static void register_service(Agent* agent)
+{
+    agent->registerService(
+        kw::id      = SERVICE_ID,
+        kw::name    = SERVICE_NAME,
+        kw::address = "127.0.0.1",
+        // 必须与 server.start() 的端口一致, 否则客户端会连到没人监听的端口
+        kw::port    = g_port,
+        kw::check   = TtlCheck(std::chrono::seconds{ TTL_SEC })
+    );
+    g_registered = true;
+    cout << "[INFO] 已注册到 Consul: " << SERVICE_ID
+         << " 127.0.0.1:" << g_port << endl;
+}
+
+// 心跳回调: 已注册则续期, 未注册则重试注册 (Consul 后恢复时可自愈)
 static void timer_callback(WFTimerTask* task)
 {
     if (task->get_state() != WFT_STATE_SUCCESS) {
@@ -151,12 +180,27 @@ static void timer_callback(WFTimerTask* task)
     }
     SeriesWork* series = series_of(task);
     Agent* agent = (Agent*)series->get_context();
-    agent->servicePass("UserService1");     // 发送心跳检测包
-    
+
+    // 异常必须在这里捕获: 穿过 workflow 回调会导致整个进程 terminate
+    // (之前 Consul 不可达时就是这么崩的)
+    if (agent != nullptr) {
+        try {
+            if (g_registered) {
+                agent->servicePass(SERVICE_ID);   // 续期心跳
+            } else {
+                register_service(agent);          // 上次失败, 重试
+                agent->servicePass(SERVICE_ID);   // 重注册后立即续期, 否则要等下一轮
+            }
+        } catch (const std::exception& e) {
+            g_registered = false;
+            cerr << "[WARN] Consul 交互失败 (服务仍在正常响应): " << e.what() << endl;
+        }
+    }
+
     WFTimerTask* nextTask = WFTaskFactory::create_timer_task(
         "health_check",
-        9, 
-        0, 
+        HEARTBEAT_SEC,
+        0,
         timer_callback
     );
     series->push_back(nextTask);
@@ -167,42 +211,51 @@ int main()
 	GOOGLE_PROTOBUF_VERIFY_VERSION;
 
 	signal(SIGINT, sig_handler);
-	unsigned short port = 1412;
+	g_port = 1412;
 	SRPCServer server;
 
 	UserServiceServiceImpl userservice_impl;
 	server.add_service(&userservice_impl);
 
-	if (server.start(port) == 0) {
-        Consul consul { "http://127.0.0.1:8500", ppconsul::kw::dc = "dc1" };
-        Agent agent{ consul };
-        agent.registerService(
-        kw::id = "UserService1",
-        kw::name = "UserService",
-        kw::address = "127.0.0.1",
-        // 必须与 server.start() 的端口一致, 否则客户端会连到没人监听的端口
-        kw::port = port,
-        kw::check = TtlCheck(std::chrono::seconds{ 10 })
-    );
-
-    agent.servicePass("UserService1");  // 发送心跳检测包
-    // 之后每9秒发送一个心跳检测包
-    WFTimerTask* timerTask = WFTaskFactory::create_timer_task(
-        "health_check",
-        9, 
-        0, 
-        timer_callback
-    );
-    SeriesWork* series = Workflow::create_series_work(timerTask, nullptr);
-    series->set_context(&agent);        // 设置序列的上下文 
-    series->start();
-		wait_group.wait();
-        WFTaskFactory::cancel_by_name("health_check");
-		server.stop();
-	} else {
+	if (server.start(g_port) != 0) {
 		cerr << "Error: start SRPCServer failed!" << endl;
 		exit(1);
 	}
+
+	// 服务注册: 失败只告警、不阻断启动。
+	// 之前这里没有 try, Consul 不可达时 ppconsul 抛异常直接 terminate,
+	// 导致"注册中心挂 -> 用户服务起不来 -> 登录全挂"的连锁故障。
+	// 现在降级为: 服务照常响应, 只是暂时不会被服务发现找到。
+	Consul* consul = nullptr;
+	Agent*  agent  = nullptr;
+	try {
+		consul = new Consul{ CONSUL_ADDR, ppconsul::kw::dc = "dc1" };
+		agent  = new Agent{ *consul };
+		register_service(agent);
+		agent->servicePass(SERVICE_ID);
+	} catch (const std::exception& e) {
+		g_registered = false;
+		cerr << "[WARN] 服务注册失败, 降级运行 (实例暂不可被发现): "
+			 << e.what() << endl;
+	}
+
+	// 心跳序列: 每 HEARTBEAT_SEC 秒一次, 兼做注册重试
+	WFTimerTask* timerTask = WFTaskFactory::create_timer_task(
+		"health_check",
+		HEARTBEAT_SEC,
+		0,
+		timer_callback
+	);
+	SeriesWork* series = Workflow::create_series_work(timerTask, nullptr);
+	series->set_context(agent);        // 可能为 nullptr, timer_callback 里判空
+	series->start();
+
+	wait_group.wait();
+	WFTaskFactory::cancel_by_name("health_check");
+	server.stop();
+
+	delete agent;
+	delete consul;
 
 	google::protobuf::ShutdownProtobufLibrary();
 	return 0;
