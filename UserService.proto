@@ -1,0 +1,23 @@
+// IDL文件
+syntax = "proto3";
+
+message UserRequest {
+    string username = 1;
+    string password = 2;
+};
+
+message UserResponse {
+    bool success = 1;
+    optional int32 id = 2;
+    optional string username = 3;
+    optional string createdAt = 4;
+    optional string token = 5;
+}
+
+// 定义 User 服务
+service UserService {
+    rpc sign_up(UserRequest) returns (UserResponse);
+    rpc sign_in(UserRequest) returns (UserResponse);
+}
+
+

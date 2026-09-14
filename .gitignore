@@ -16,3 +16,4 @@ static/spa/
 *.o
 *.swp
 .DS_Store
+ossbackup
