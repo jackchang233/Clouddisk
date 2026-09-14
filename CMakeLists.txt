@@ -23,6 +23,7 @@ add_executable(server
     ErrorUtil.cpp
     ValidatorUtil.cpp
     OSSManager.cpp
+    UserService.pb.cc        # 消息序列化 (登录/注册业务已下沉到 sign_server)
     main.cpp
 )
 
@@ -38,6 +39,42 @@ target_link_libraries(server PRIVATE
     pthread
     wfrest
     SimpleAmqpClient
+    srpc                     # 作为 RPC 客户端调用 UserService
+    workflow
+    protobuf
+    lz4
+    snappy
+)
+
+# 用户服务 (srpc RPC, 监听 1412)
+#
+# 注意: 不要给这个 target 加 -L/usr/local/lib。系统里有两套 protobuf:
+#   /usr/local/lib/libprotobuf.so.31 (3.21)   <- 缺少 pb.cc 需要的符号
+#   /usr/lib/x86_64-linux-gnu/libprotobuf.so.32 (4.25) <- 正确的那套
+# 默认链接顺序恰好选中系统那套；一旦显式加 -L/usr/local/lib，会被 so.31 抢先而链接失败。
+#
+# 另: UserService.srpc.h 无法重新生成 (protoc-gen-srpc 未安装)，必须提交进仓库。
+add_executable(sign_server
+    sign_server.cc
+    UserService.pb.cc
+    CryptoUtil.cpp
+)
+
+target_include_directories(sign_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}    # UserService.pb.h / UserService.srpc.h
+)
+
+target_link_libraries(sign_server PRIVATE
+    srpc
+    workflow
+    protobuf
+    lz4
+    snappy
+    ppconsul          # 服务注册 + TTL 心跳
+    jwt
+    crypto
+    ssl
+    pthread
 )
 
 # OSS 备份消费者 (RabbitMQ worker, 从 ossbackup 交换机消费消息并上传到 OSS)

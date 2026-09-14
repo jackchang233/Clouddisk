@@ -19,6 +19,7 @@ int main()
 
     svr.register_modules();
     svr.start_recycle_sweep();
+    svr.start_service_discovery();
 
     if (svr.track().start(8888) == 0) {
         svr.list_routes();

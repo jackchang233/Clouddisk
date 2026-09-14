@@ -14,6 +14,9 @@ public:
     // 启动回收站定时清理 (软删超期彻底删除)
     void start_recycle_sweep();
 
+    // 启动服务发现后台刷新 (定时从 Consul 拉 UserService 实例表)
+    void start_service_discovery();
+
     int start(unsigned short port) { return m_server.start(port); }
 
     void stop() { m_server.stop(); }
@@ -37,13 +40,5 @@ private:
     void register_recycle_module();
 private:
 
-    wfrest::HttpServer m_server {};    
+    wfrest::HttpServer m_server {};
 };
-
-
-// 转义并包上单引号，得到安全的 SQL 字符串字面量 (防注入)
-// 注意用 escape_string (反斜杠转义) 而非 escape_string_quote (引号翻倍, 仅 NO_BACKSLASH_ESCAPES 模式适用)
-
-static string sql_quote(const string& s){
-    return "'" + MySQLUtil::escape_string(s) + "'";
-}

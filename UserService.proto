@@ -12,6 +12,8 @@ message UserResponse {
     optional string username = 3;
     optional string createdAt = 4;
     optional string token = 5;
+    // 失败原因，供调用方区分「用户名已存在」「密码错误」「服务不可用」等
+    optional string err_msg = 6;
 }
 
 // 定义 User 服务

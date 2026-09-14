@@ -350,6 +350,7 @@ class UserResponse final :
     kUsernameFieldNumber = 3,
     kCreatedAtFieldNumber = 4,
     kTokenFieldNumber = 5,
+    kErrMsgFieldNumber = 6,
     kSuccessFieldNumber = 1,
     kIdFieldNumber = 2,
   };
@@ -407,6 +408,24 @@ class UserResponse final :
   std::string* _internal_mutable_token();
   public:
 
+  // optional string err_msg = 6;
+  bool has_err_msg() const;
+  private:
+  bool _internal_has_err_msg() const;
+  public:
+  void clear_err_msg();
+  const std::string& err_msg() const;
+  template <typename ArgT0 = const std::string&, typename... ArgT>
+  void set_err_msg(ArgT0&& arg0, ArgT... args);
+  std::string* mutable_err_msg();
+  PROTOBUF_NODISCARD std::string* release_err_msg();
+  void set_allocated_err_msg(std::string* err_msg);
+  private:
+  const std::string& _internal_err_msg() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_err_msg(const std::string& value);
+  std::string* _internal_mutable_err_msg();
+  public:
+
   // bool success = 1;
   void clear_success();
   bool success() const;
@@ -442,6 +461,7 @@ class UserResponse final :
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr username_;
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr createdat_;
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr token_;
+    ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr err_msg_;
     bool success_;
     int32_t id_;
   };
@@ -585,7 +605,7 @@ inline void UserResponse::set_success(bool value) {
 
 // optional int32 id = 2;
 inline bool UserResponse::_internal_has_id() const {
-  bool value = (_impl_._has_bits_[0] & 0x00000008u) != 0;
+  bool value = (_impl_._has_bits_[0] & 0x00000010u) != 0;
   return value;
 }
 inline bool UserResponse::has_id() const {
@@ -593,7 +613,7 @@ inline bool UserResponse::has_id() const {
 }
 inline void UserResponse::clear_id() {
   _impl_.id_ = 0;
-  _impl_._has_bits_[0] &= ~0x00000008u;
+  _impl_._has_bits_[0] &= ~0x00000010u;
 }
 inline int32_t UserResponse::_internal_id() const {
   return _impl_.id_;
@@ -603,7 +623,7 @@ inline int32_t UserResponse::id() const {
   return _internal_id();
 }
 inline void UserResponse::_internal_set_id(int32_t value) {
-  _impl_._has_bits_[0] |= 0x00000008u;
+  _impl_._has_bits_[0] |= 0x00000010u;
   _impl_.id_ = value;
 }
 inline void UserResponse::set_id(int32_t value) {
@@ -813,6 +833,74 @@ inline void UserResponse::set_allocated_token(std::string* token) {
   }
 #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
   // @@protoc_insertion_point(field_set_allocated:UserResponse.token)
+}
+
+// optional string err_msg = 6;
+inline bool UserResponse::_internal_has_err_msg() const {
+  bool value = (_impl_._has_bits_[0] & 0x00000008u) != 0;
+  return value;
+}
+inline bool UserResponse::has_err_msg() const {
+  return _internal_has_err_msg();
+}
+inline void UserResponse::clear_err_msg() {
+  _impl_.err_msg_.ClearToEmpty();
+  _impl_._has_bits_[0] &= ~0x00000008u;
+}
+inline const std::string& UserResponse::err_msg() const {
+  // @@protoc_insertion_point(field_get:UserResponse.err_msg)
+  return _internal_err_msg();
+}
+template <typename ArgT0, typename... ArgT>
+inline PROTOBUF_ALWAYS_INLINE
+void UserResponse::set_err_msg(ArgT0&& arg0, ArgT... args) {
+ _impl_._has_bits_[0] |= 0x00000008u;
+ _impl_.err_msg_.Set(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
+  // @@protoc_insertion_point(field_set:UserResponse.err_msg)
+}
+inline std::string* UserResponse::mutable_err_msg() {
+  std::string* _s = _internal_mutable_err_msg();
+  // @@protoc_insertion_point(field_mutable:UserResponse.err_msg)
+  return _s;
+}
+inline const std::string& UserResponse::_internal_err_msg() const {
+  return _impl_.err_msg_.Get();
+}
+inline void UserResponse::_internal_set_err_msg(const std::string& value) {
+  _impl_._has_bits_[0] |= 0x00000008u;
+  _impl_.err_msg_.Set(value, GetArenaForAllocation());
+}
+inline std::string* UserResponse::_internal_mutable_err_msg() {
+  _impl_._has_bits_[0] |= 0x00000008u;
+  return _impl_.err_msg_.Mutable(GetArenaForAllocation());
+}
+inline std::string* UserResponse::release_err_msg() {
+  // @@protoc_insertion_point(field_release:UserResponse.err_msg)
+  if (!_internal_has_err_msg()) {
+    return nullptr;
+  }
+  _impl_._has_bits_[0] &= ~0x00000008u;
+  auto* p = _impl_.err_msg_.Release();
+#ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (_impl_.err_msg_.IsDefault()) {
+    _impl_.err_msg_.Set("", GetArenaForAllocation());
+  }
+#endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  return p;
+}
+inline void UserResponse::set_allocated_err_msg(std::string* err_msg) {
+  if (err_msg != nullptr) {
+    _impl_._has_bits_[0] |= 0x00000008u;
+  } else {
+    _impl_._has_bits_[0] &= ~0x00000008u;
+  }
+  _impl_.err_msg_.SetAllocated(err_msg, GetArenaForAllocation());
+#ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (_impl_.err_msg_.IsDefault()) {
+    _impl_.err_msg_.Set("", GetArenaForAllocation());
+  }
+#endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  // @@protoc_insertion_point(field_set_allocated:UserResponse.err_msg)
 }
 
 #ifdef __GNUC__

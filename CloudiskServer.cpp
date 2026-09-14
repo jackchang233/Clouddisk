@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -18,6 +19,8 @@
 #include "ErrorUtil.h"
 #include "ValidatorUtil.h"
 #include "OSSManager.h"
+#include "ServiceRegistry.h"
+#include "SqlUtil.h"
 #include "UserService.srpc.h"
 #include "UserService.pb.h"
 
@@ -52,6 +55,79 @@ static string percent_encode(const string& s){
         }
     }
     return out;
+}
+
+// RPC 调用失败时取出可读的错误文案:
+//   - 传输层失败 (ctx.success == false) => 服务不可达，给通用文案
+//   - 业务失败 => 用服务端 err_msg 给的具体原因，没填则回落 fallback
+static string rpc_err_msg(const srpc::RPCSyncContext& ctx, const UserResponse& response,
+                          const string& fallback)
+{
+    if (!ctx.success) return "用户服务暂不可用，请稍后重试";
+    string msg = response.err_msg();
+    return msg.empty() ? fallback : msg;
+}
+
+/*********************************************************************************
+ *                     服务发现: 后台刷新 UserService 实例表                      *
+ *********************************************************************************/
+static const char* CONSUL_USER_SERVICE_URL =
+    "http://127.0.0.1:8500/v1/health/service/UserService?passing=true";
+static const time_t SERVICE_REFRESH_INTERVAL = 30;
+
+// 从 Consul 拉一次实例表写进进程内缓存。
+//
+// 失败时只打日志、保留旧缓存 (stale-while-revalidate) —— 在线请求读的是缓存,
+// 所以 Consul 抖动不会影响登录/注册。
+static void refresh_user_service()
+{
+    WFHttpTask* task = WFTaskFactory::create_http_task(CONSUL_USER_SERVICE_URL, 3, 3,
+        [](WFHttpTask* task)
+        {
+            ServiceInstance inst;
+            string body;   // 放到 try 外, 便于失败时打印原始响应辅助定位
+            try {
+                if (task->get_state() != WFT_STATE_SUCCESS)
+                    throw std::runtime_error("Consul 请求失败");
+
+                body = HttpUtil::decode_chunked_body(task->get_resp());
+                if (body.empty())
+                    throw std::runtime_error("Consul 返回空响应");
+
+                // 必须包 try: 异常穿过回调会让整个进程 terminate (曾经的实际故障)
+                nlohmann::json data = nlohmann::json::parse(body);
+                if (data.size() == 0)
+                    throw std::runtime_error("Consul 无健康实例");
+
+                inst.ip   = data[0]["Service"]["Address"].get<string>();
+                inst.port = data[0]["Service"]["Port"].get<unsigned short>();
+                if (!inst.valid())
+                    throw std::runtime_error("实例地址非法");
+            } catch (const std::exception& e) {
+                cout << "[WARN] 刷新 UserService 实例失败: " << e.what()
+                     << " | 响应前 40 字节: [" << body.substr(0, 40) << "]"
+                     << " (沿用旧缓存)" << endl;
+                return ;
+            }
+            ServiceRegistry::instance().update(inst);
+            cout << "[INFO] UserService 实例: " << inst.ip << ":" << inst.port << endl;
+        });
+    task->start();
+}
+
+// 定时回调: 刷一次后重新调度下一次
+static void service_refresh_timer_callback(WFTimerTask*)
+{
+    refresh_user_service();
+    WFTaskFactory::create_timer_task(SERVICE_REFRESH_INTERVAL, 0,
+        service_refresh_timer_callback)->start();
+}
+
+void CloudiskServer::start_service_discovery()
+{
+    refresh_user_service();   // 立即拉一次, 不等第一个周期
+    WFTaskFactory::create_timer_task(SERVICE_REFRESH_INTERVAL, 0,
+        service_refresh_timer_callback)->start();
 }
 
 
@@ -126,11 +202,14 @@ void CloudiskServer::register_signup_module()
             ErrorUtil::send_error(resp, 400, invalid_reason);
             return ;
         }
-        // 3. 校验通过后，创建MySQL任务，将用户名和密码插入到MySQL数据库
-            // 3.校验通过后，远程同步调用UserService的sign_up()方法
-        const char* ip = "127.0.0.1";
-        unsigned short port = 1412;
-        UserService::SRPCClient client{ ip, port };
+        // 3. 从进程内缓存取实例 (不查 Consul, 不阻塞线程)
+        ServiceInstance inst = ServiceRegistry::instance().get();
+        if (!inst.valid()) {
+            ErrorUtil::send_error(resp, 503, "用户服务暂时不可用，请稍后重试");
+            return ;
+        }
+
+        UserService::SRPCClient client{ inst.ip.c_str(), inst.port };
         // 设置请求
         UserRequest request;
         request.set_username(username);
@@ -140,12 +219,11 @@ void CloudiskServer::register_signup_module()
         srpc::RPCSyncContext ctx;
         client.sign_up(&request, &response, &ctx);
 
-        // 4. 返回响应
+        // 4. 返回响应 (统一 JSON 错误体, 前端 api.js 依赖 {"code","msg"})
         if (ctx.success && response.success()) {
             resp->String("SUCCESS");
         } else {
-            resp->set_status(HttpStatusBadRequest);
-            resp->String("<html>用户名已存在</html>");
+            ErrorUtil::send_error(resp, 400, rpc_err_msg(ctx, response, "注册失败，请稍后重试"));
         }
     });
 }
@@ -174,9 +252,13 @@ void CloudiskServer::register_signin_module()
             ErrorUtil::send_error(resp, 400);
             return ;
         }
-       const char* ip = "127.0.0.1";
-        unsigned short port = 1412;
-        UserService::SRPCClient client{ ip, port };
+        // 从进程内缓存取实例 (不查 Consul, 不阻塞线程)
+        ServiceInstance inst = ServiceRegistry::instance().get();
+        if (!inst.valid()) {
+            ErrorUtil::send_error(resp, 503, "用户服务暂时不可用，请稍后重试");
+            return ;
+        }
+        UserService::SRPCClient client{ inst.ip.c_str(), inst.port };
         // 设置请求
         UserRequest request;
         request.set_username(username);
@@ -184,22 +266,21 @@ void CloudiskServer::register_signin_module()
         // 同步调用
         UserResponse response;
         srpc::RPCSyncContext ctx;
-        client.sign_up(&request, &response, &ctx);
+        client.sign_in(&request, &response, &ctx);
 
-        // 4. 返回响应
+        // 4. 返回响应 (统一 JSON 错误体, 前端 api.js 依赖 {"code","msg"})
         if (ctx.success && response.success()) {
-        nlohmann::json data;
-        data["Username"] = response.username();
-        data["Token"] = response.token();
-        data["Location"] = "/static/view/home.html";    /* 跳转到用户中心页面 */
+            nlohmann::json body;
+            body["Username"] = response.username();
+            body["Token"] = response.token();
+            body["Location"] = "/spa/";    /* 跳转到 SPA 首页 */
 
-        nlohmann::json json;
-        json["data"] = data;
-        resp->String(json.dump());
-    } else {
-        resp->set_status(HttpStatusBadRequest);
-        resp->String("<html>用户名或密码错误</html>");
-    }
+            nlohmann::json json;
+            json["data"] = body;
+            resp->String(json.dump());
+        } else {
+            ErrorUtil::send_error(resp, 400, rpc_err_msg(ctx, response, "用户名或密码错误"));
+        }
     });
 }
 

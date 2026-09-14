@@ -1,6 +1,7 @@
 # 编译产物
 build/
 server
+sign_server
 
 # 敏感配置 (真实 AK/SK，勿提交；示例文件 OSS.env.example 需保留)
 OSS.env
@@ -17,3 +18,4 @@ static/spa/
 *.swp
 .DS_Store
 ossbackup
+sign_server

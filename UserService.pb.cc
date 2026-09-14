@@ -41,6 +41,7 @@ PROTOBUF_CONSTEXPR UserResponse::UserResponse(
   , /*decltype(_impl_.username_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
   , /*decltype(_impl_.createdat_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
   , /*decltype(_impl_.token_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
+  , /*decltype(_impl_.err_msg_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
   , /*decltype(_impl_.success_)*/false
   , /*decltype(_impl_.id_)*/0} {}
 struct UserResponseDefaultTypeInternal {
@@ -76,15 +77,17 @@ const uint32_t TableStruct_UserService_2eproto::offsets[] PROTOBUF_SECTION_VARIA
   PROTOBUF_FIELD_OFFSET(::UserResponse, _impl_.username_),
   PROTOBUF_FIELD_OFFSET(::UserResponse, _impl_.createdat_),
   PROTOBUF_FIELD_OFFSET(::UserResponse, _impl_.token_),
+  PROTOBUF_FIELD_OFFSET(::UserResponse, _impl_.err_msg_),
   ~0u,
-  3,
+  4,
   0,
   1,
   2,
+  3,
 };
 static const ::_pbi::MigrationSchema schemas[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) = {
   { 0, -1, -1, sizeof(::UserRequest)},
-  { 8, 19, -1, sizeof(::UserResponse)},
+  { 8, 20, -1, sizeof(::UserResponse)},
 };
 
 static const ::_pb::Message* const file_default_instances[] = {
@@ -94,18 +97,19 @@ static const ::_pb::Message* const file_default_instances[] = {
 
 const char descriptor_table_protodef_UserService_2eproto[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) =
   "\n\021UserService.proto\"1\n\013UserRequest\022\020\n\010us"
-  "ername\030\001 \001(\t\022\020\n\010password\030\002 \001(\t\"\237\001\n\014UserR"
+  "ername\030\001 \001(\t\022\020\n\010password\030\002 \001(\t\"\301\001\n\014UserR"
   "esponse\022\017\n\007success\030\001 \001(\010\022\017\n\002id\030\002 \001(\005H\000\210\001"
   "\001\022\025\n\010username\030\003 \001(\tH\001\210\001\001\022\026\n\tcreatedAt\030\004 "
-  "\001(\tH\002\210\001\001\022\022\n\005token\030\005 \001(\tH\003\210\001\001B\005\n\003_idB\013\n\t_"
-  "usernameB\014\n\n_createdAtB\010\n\006_token2]\n\013User"
-  "Service\022&\n\007sign_up\022\014.UserRequest\032\r.UserR"
-  "esponse\022&\n\007sign_in\022\014.UserRequest\032\r.UserR"
-  "esponseb\006proto3"
+  "\001(\tH\002\210\001\001\022\022\n\005token\030\005 \001(\tH\003\210\001\001\022\024\n\007err_msg\030"
+  "\006 \001(\tH\004\210\001\001B\005\n\003_idB\013\n\t_usernameB\014\n\n_creat"
+  "edAtB\010\n\006_tokenB\n\n\010_err_msg2]\n\013UserServic"
+  "e\022&\n\007sign_up\022\014.UserRequest\032\r.UserRespons"
+  "e\022&\n\007sign_in\022\014.UserRequest\032\r.UserRespons"
+  "eb\006proto3"
   ;
 static ::_pbi::once_flag descriptor_table_UserService_2eproto_once;
 const ::_pbi::DescriptorTable descriptor_table_UserService_2eproto = {
-    false, false, 335, descriptor_table_protodef_UserService_2eproto,
+    false, false, 369, descriptor_table_protodef_UserService_2eproto,
     "UserService.proto",
     &descriptor_table_UserService_2eproto_once, nullptr, 0, 2,
     schemas, file_default_instances, TableStruct_UserService_2eproto::offsets,
@@ -378,7 +382,7 @@ class UserResponse::_Internal {
  public:
   using HasBits = decltype(std::declval<UserResponse>()._impl_._has_bits_);
   static void set_has_id(HasBits* has_bits) {
-    (*has_bits)[0] |= 8u;
+    (*has_bits)[0] |= 16u;
   }
   static void set_has_username(HasBits* has_bits) {
     (*has_bits)[0] |= 1u;
@@ -388,6 +392,9 @@ class UserResponse::_Internal {
   }
   static void set_has_token(HasBits* has_bits) {
     (*has_bits)[0] |= 4u;
+  }
+  static void set_has_err_msg(HasBits* has_bits) {
+    (*has_bits)[0] |= 8u;
   }
 };
 
@@ -406,6 +413,7 @@ UserResponse::UserResponse(const UserResponse& from)
     , decltype(_impl_.username_){}
     , decltype(_impl_.createdat_){}
     , decltype(_impl_.token_){}
+    , decltype(_impl_.err_msg_){}
     , decltype(_impl_.success_){}
     , decltype(_impl_.id_){}};
 
@@ -434,6 +442,14 @@ UserResponse::UserResponse(const UserResponse& from)
     _this->_impl_.token_.Set(from._internal_token(), 
       _this->GetArenaForAllocation());
   }
+  _impl_.err_msg_.InitDefault();
+  #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+    _impl_.err_msg_.Set("", GetArenaForAllocation());
+  #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (from._internal_has_err_msg()) {
+    _this->_impl_.err_msg_.Set(from._internal_err_msg(), 
+      _this->GetArenaForAllocation());
+  }
   ::memcpy(&_impl_.success_, &from._impl_.success_,
     static_cast<size_t>(reinterpret_cast<char*>(&_impl_.id_) -
     reinterpret_cast<char*>(&_impl_.success_)) + sizeof(_impl_.id_));
@@ -450,6 +466,7 @@ inline void UserResponse::SharedCtor(
     , decltype(_impl_.username_){}
     , decltype(_impl_.createdat_){}
     , decltype(_impl_.token_){}
+    , decltype(_impl_.err_msg_){}
     , decltype(_impl_.success_){false}
     , decltype(_impl_.id_){0}
   };
@@ -464,6 +481,10 @@ inline void UserResponse::SharedCtor(
   _impl_.token_.InitDefault();
   #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
     _impl_.token_.Set("", GetArenaForAllocation());
+  #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  _impl_.err_msg_.InitDefault();
+  #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+    _impl_.err_msg_.Set("", GetArenaForAllocation());
   #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
 }
 
@@ -481,6 +502,7 @@ inline void UserResponse::SharedDtor() {
   _impl_.username_.Destroy();
   _impl_.createdat_.Destroy();
   _impl_.token_.Destroy();
+  _impl_.err_msg_.Destroy();
 }
 
 void UserResponse::SetCachedSize(int size) const {
@@ -494,7 +516,7 @@ void UserResponse::Clear() {
   (void) cached_has_bits;
 
   cached_has_bits = _impl_._has_bits_[0];
-  if (cached_has_bits & 0x00000007u) {
+  if (cached_has_bits & 0x0000000fu) {
     if (cached_has_bits & 0x00000001u) {
       _impl_.username_.ClearNonDefaultToEmpty();
     }
@@ -503,6 +525,9 @@ void UserResponse::Clear() {
     }
     if (cached_has_bits & 0x00000004u) {
       _impl_.token_.ClearNonDefaultToEmpty();
+    }
+    if (cached_has_bits & 0x00000008u) {
+      _impl_.err_msg_.ClearNonDefaultToEmpty();
     }
   }
   _impl_.success_ = false;
@@ -562,6 +587,16 @@ const char* UserResponse::_InternalParse(const char* ptr, ::_pbi::ParseContext* 
           ptr = ::_pbi::InlineGreedyStringParser(str, ptr, ctx);
           CHK_(ptr);
           CHK_(::_pbi::VerifyUTF8(str, "UserResponse.token"));
+        } else
+          goto handle_unusual;
+        continue;
+      // optional string err_msg = 6;
+      case 6:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 50)) {
+          auto str = _internal_mutable_err_msg();
+          ptr = ::_pbi::InlineGreedyStringParser(str, ptr, ctx);
+          CHK_(ptr);
+          CHK_(::_pbi::VerifyUTF8(str, "UserResponse.err_msg"));
         } else
           goto handle_unusual;
         continue;
@@ -637,6 +672,16 @@ uint8_t* UserResponse::_InternalSerialize(
         5, this->_internal_token(), target);
   }
 
+  // optional string err_msg = 6;
+  if (_internal_has_err_msg()) {
+    ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::VerifyUtf8String(
+      this->_internal_err_msg().data(), static_cast<int>(this->_internal_err_msg().length()),
+      ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::SERIALIZE,
+      "UserResponse.err_msg");
+    target = stream->WriteStringMaybeAliased(
+        6, this->_internal_err_msg(), target);
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
         _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
@@ -654,7 +699,7 @@ size_t UserResponse::ByteSizeLong() const {
   (void) cached_has_bits;
 
   cached_has_bits = _impl_._has_bits_[0];
-  if (cached_has_bits & 0x00000007u) {
+  if (cached_has_bits & 0x0000000fu) {
     // optional string username = 3;
     if (cached_has_bits & 0x00000001u) {
       total_size += 1 +
@@ -676,6 +721,13 @@ size_t UserResponse::ByteSizeLong() const {
           this->_internal_token());
     }
 
+    // optional string err_msg = 6;
+    if (cached_has_bits & 0x00000008u) {
+      total_size += 1 +
+        ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::StringSize(
+          this->_internal_err_msg());
+    }
+
   }
   // bool success = 1;
   if (this->_internal_success() != 0) {
@@ -683,7 +735,7 @@ size_t UserResponse::ByteSizeLong() const {
   }
 
   // optional int32 id = 2;
-  if (cached_has_bits & 0x00000008u) {
+  if (cached_has_bits & 0x00000010u) {
     total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(this->_internal_id());
   }
 
@@ -706,7 +758,7 @@ void UserResponse::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::P
   (void) cached_has_bits;
 
   cached_has_bits = from._impl_._has_bits_[0];
-  if (cached_has_bits & 0x00000007u) {
+  if (cached_has_bits & 0x0000000fu) {
     if (cached_has_bits & 0x00000001u) {
       _this->_internal_set_username(from._internal_username());
     }
@@ -716,11 +768,14 @@ void UserResponse::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::P
     if (cached_has_bits & 0x00000004u) {
       _this->_internal_set_token(from._internal_token());
     }
+    if (cached_has_bits & 0x00000008u) {
+      _this->_internal_set_err_msg(from._internal_err_msg());
+    }
   }
   if (from._internal_success() != 0) {
     _this->_internal_set_success(from._internal_success());
   }
-  if (cached_has_bits & 0x00000008u) {
+  if (cached_has_bits & 0x00000010u) {
     _this->_internal_set_id(from._internal_id());
   }
   _this->_internal_metadata_.MergeFrom<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(from._internal_metadata_);
@@ -754,6 +809,10 @@ void UserResponse::InternalSwap(UserResponse* other) {
   ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr::InternalSwap(
       &_impl_.token_, lhs_arena,
       &other->_impl_.token_, rhs_arena
+  );
+  ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr::InternalSwap(
+      &_impl_.err_msg_, lhs_arena,
+      &other->_impl_.err_msg_, rhs_arena
   );
   ::PROTOBUF_NAMESPACE_ID::internal::memswap<
       PROTOBUF_FIELD_OFFSET(UserResponse, _impl_.id_)
