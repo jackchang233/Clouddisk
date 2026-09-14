@@ -11,11 +11,15 @@
 #include <unistd.h>
 #include <SimpleAmqpClient/SimpleAmqpClient.h>
 #include <nlohmann/json.hpp>
+
+
 #include "CloudiskServer.h"
 #include "CryptoUtil.h"
 #include "ErrorUtil.h"
 #include "ValidatorUtil.h"
 #include "OSSManager.h"
+#include "UserService.srpc.h"
+#include "UserService.pb.h"
 
 using namespace std;
 using namespace wfrest;
@@ -50,11 +54,6 @@ static string percent_encode(const string& s){
     return out;
 }
 
-// 转义并包上单引号，得到安全的 SQL 字符串字面量 (防注入)
-// 注意用 escape_string (反斜杠转义) 而非 escape_string_quote (引号翻倍, 仅 NO_BACKSLASH_ESCAPES 模式适用)
-static string sql_quote(const string& s){
-    return "'" + MySQLUtil::escape_string(s) + "'";
-}
 
 void CloudiskServer::register_modules()
 {
@@ -128,26 +127,26 @@ void CloudiskServer::register_signup_module()
             return ;
         }
         // 3. 校验通过后，创建MySQL任务，将用户名和密码插入到MySQL数据库
-        //    提示: CryptoUtil::generate_salt() 生成盐值
-        //          CryptoUtil::hash_password(password, salt) 计算哈希
-        //          INSERT INTO tbl_user (username, password, salt) VALUES (...)
-        //          resp->MySQL(MYSQL_URL, sql, 回调): 失败返回500，成功返回"SUCCESS"
-        string salt = CryptoUtil::generate_salt();
-        string hashcode = CryptoUtil::hash_password(password, salt);
-        string sql = "INSERT INTO tbl_user (username, password, salt) VALUES ("
-            + sql_quote(username) + ", "
-            + sql_quote(hashcode) + ", "
-            + sql_quote(salt) + ")";
-        cout << "[SQL] " << sql << endl;   /* 日志 */
+            // 3.校验通过后，远程同步调用UserService的sign_up()方法
+        const char* ip = "127.0.0.1";
+        unsigned short port = 1412;
+        UserService::SRPCClient client{ ip, port };
+        // 设置请求
+        UserRequest request;
+        request.set_username(username);
+        request.set_password(password);
+        // 同步调用
+        UserResponse response;
+        srpc::RPCSyncContext ctx;
+        client.sign_up(&request, &response, &ctx);
 
-        resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
-        {
-            if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {;
-                ErrorUtil::send_error(resp, 500);
-                return ;
-            }    
+        // 4. 返回响应
+        if (ctx.success && response.success()) {
             resp->String("SUCCESS");
-        });
+        } else {
+            resp->set_status(HttpStatusBadRequest);
+            resp->String("<html>用户名已存在</html>");
+        }
     });
 }
 
@@ -155,62 +154,6 @@ void CloudiskServer::register_signup_module()
 /*********************************************************************************
  *                               登录                                            *
  *********************************************************************************/
-void signin_callback(HttpResp* resp, string password, WFMySQLTask* task)
-{
-    if(task->get_state() != WFT_STATE_SUCCESS){
-        ErrorUtil::send_error(resp, 500);
-        return;
-    }
-    /* MySQL任务失败
-       提示: task->get_state() != WFT_STATE_SUCCESS 或
-             task->get_resp()->get_packet_type() == MYSQL_PACKET_ERROR 时返回500 */
-    MySQLResultCursor cursor = task->get_resp();
-    std::vector<MySQLCell> record; 
-    // MySQL任务执行成功
-    // TODO: 用 task->get_resp() 构造 MySQLResultCursor，fetch_row 取出记录
-    //       空结果集 => 用户不存在，返回400 "用户名或密码错误"
-    if(!cursor.fetch_row(record)){
-        ErrorUtil::send_error(resp, 400, "用户名或密码错误");
-        return;
-    }
-    // TODO: 将记录字段 (id/username/hashcode/salt/createdAt) 填入 User 结构体
-    User user;
-    user.id=record[0].as_int();
-    user.username=record[1].as_string();
-    user.hashcode = record[2].as_string();
-    user.salt = record[3].as_string();
-    user.createdAt = record[4].as_datetime();
-#ifdef DEBUG
-    cout << "User{ id: " << user.id
-        << ", username: " << user.username
-        << ", hashcode: " << user.hashcode
-        << ", salt: " << user.salt
-        << ", createdAt: " << user.createdAt << " }" << endl;
-#endif
-    string hashcode1 = CryptoUtil::hash_password(password, user.salt);
-#ifdef DEBUG
-    std::cout << "generated hashcode: " << hashcode1 << "\n";
-#endif
-    if (hashcode1 == user.hashcode) {
-        nlohmann::json data;
-        data["Token"] = CryptoUtil::generate_token(user);
-        data["Username"] = user.username;
-        data["Location"] = "/spa/";    /* 跳转到 SPA 首页 */
-
-        nlohmann::json json;
-        json["data"] = data;
-        resp->String(json.dump(2));
-        return ;
-    }
-    // 密码错误
-    ErrorUtil::send_error(resp, 400, "用户名或密码错误");
-    return;
-    // TODO: CryptoUtil::hash_password(password, user.salt) 与库中hashcode比对
-    //       一致 => CryptoUtil::generate_token(user) 生成Token，
-    //               组装json { data: {Token, Username, Location} } 返回
-    //       不一致 => 返回400 "用户名或密码错误"
-}
-
 void CloudiskServer::register_signin_module()
 {
     // 精确路由
@@ -231,21 +174,32 @@ void CloudiskServer::register_signin_module()
             ErrorUtil::send_error(resp, 400);
             return ;
         }
-        // TODO: 2. 构建SQL: SELECT * FROM tbl_user WHERE username='...' AND tomb=0
-        string sql = "SELECT * FROM tbl_user WHERE username = "
-            + sql_quote(username) + " AND tomb = 0";
-        cout<< "[SQL]" << sql << endl;
-        // TODO: 3. WFTaskFactory::create_mysql_task(MYSQL_URL, RETRY_MAX, 回调) 创建任务
-        //          回调用 std::bind 绑定 signin_callback(resp, password, _1)
-        //          task->get_req()->set_query(sql) 设置SQL
-        //          series->push_back(task) 提交任务
-        WFMySQLTask* task = WFTaskFactory::create_mysql_task(
-            MYSQL_URL,
-            RETRY_MAX,
-            std::bind(signin_callback,resp,password,_1)
-        );
-        task->get_req()->set_query(sql);
-        series->push_back(task);
+       const char* ip = "127.0.0.1";
+        unsigned short port = 1412;
+        UserService::SRPCClient client{ ip, port };
+        // 设置请求
+        UserRequest request;
+        request.set_username(username);
+        request.set_password(password);
+        // 同步调用
+        UserResponse response;
+        srpc::RPCSyncContext ctx;
+        client.sign_up(&request, &response, &ctx);
+
+        // 4. 返回响应
+        if (ctx.success && response.success()) {
+        nlohmann::json data;
+        data["Username"] = response.username();
+        data["Token"] = response.token();
+        data["Location"] = "/static/view/home.html";    /* 跳转到用户中心页面 */
+
+        nlohmann::json json;
+        json["data"] = data;
+        resp->String(json.dump());
+    } else {
+        resp->set_status(HttpStatusBadRequest);
+        resp->String("<html>用户名或密码错误</html>");
+    }
     });
 }
 
@@ -353,7 +307,7 @@ void CloudiskServer::register_fileupload_module()
                 + sql_quote(hashcode) + ", "
                 + std::to_string(content.size()) + ")";
 
-            cout << "[SQL] " << sql << endl;
+            std::cout << "[SQL] " << sql << endl;
 
             resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
             {
@@ -426,7 +380,7 @@ void CloudiskServer::register_filelist_module()
         string sql = "SELECT id, filename, hashcode, size, created_at, last_update FROM tbl_file WHERE uid="
         + std::to_string(user.id)+ " AND status = 0 LIMIT " + limit;
 
-        cout << "[SQL] " << sql << endl;
+        std::cout << "[SQL] " << sql << endl;
 
         resp->MySQL(
             MYSQL_URL,
@@ -611,7 +565,7 @@ void purge_callback(HttpResp* resp, string directory, string id_str, int uid, My
         }
         // 删行成功后尽力删物理文件: 失败只留下孤儿文件(无害)，不阻断响应
         if (unlink(filepath.c_str()) != 0) {
-            cout << "[WARN] 物理文件删除失败: " << filepath << endl;
+            std::cout << "[WARN] 物理文件删除失败: " << filepath << endl;
         }
         resp->String(R"({"code":0,"msg":"SUCCESS"})");
     });
@@ -719,7 +673,7 @@ static void recycle_sweep()
             MySQLResultCursor cursor(task->get_resp());
             int status = cursor.get_cursor_status();
             if (status == MYSQL_STATUS_ERROR) {
-                cout << "[WARN] 回收站清理查询失败 (tbl_file.deleted_at 列是否已迁移?)" << endl;
+                std::cout << "[WARN] 回收站清理查询失败 (tbl_file.deleted_at 列是否已迁移?)" << endl;
                 return;
             }
             if (status != MYSQL_STATUS_GET_RESULT) return;
@@ -740,7 +694,7 @@ static void recycle_sweep()
                     // 第三步: 删物理文件 (尽力而为, 失败留孤儿文件, 无害)
                     for (const string& p : paths) {
                         if (unlink(p.c_str()) != 0)
-                            cout << "[WARN] 回收站清理失败: " << p << endl;
+                            std::cout << "[WARN] 回收站清理失败: " << p << endl;
                     }
                 });
             del->get_req()->set_query("DELETE FROM tbl_file WHERE " + expired_cond);
