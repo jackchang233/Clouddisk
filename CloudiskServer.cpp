@@ -58,12 +58,12 @@ static string percent_encode(const string& s){
 }
 
 // RPC 调用失败时取出可读的错误文案:
-//   - 传输层失败 (ctx.success == false) => 服务不可达，给通用文案
+//   - 传输层失败 (ctx->success() == false) => 服务不可达，给通用文案
 //   - 业务失败 => 用服务端 err_msg 给的具体原因，没填则回落 fallback
-static string rpc_err_msg(const srpc::RPCSyncContext& ctx, const UserResponse& response,
+static string rpc_err_msg(const srpc::RPCContext* ctx, const UserResponse& response,
                           const string& fallback)
 {
-    if (!ctx.success) return "用户服务暂不可用，请稍后重试";
+    if (ctx == nullptr || !ctx->success()) return "用户服务暂不可用，请稍后重试";
     string msg = response.err_msg();
     return msg.empty() ? fallback : msg;
 }
@@ -187,7 +187,7 @@ void CloudiskServer::register_static_resources_module()
 
 void CloudiskServer::register_signup_module()
 {
-    m_server.POST("/user/signup", [](const HttpReq* req, HttpResp* resp)
+    m_server.POST("/user/signup", [](const HttpReq* req, HttpResp* resp, SeriesWork* series)
     {
         // TODO: 校验请求的Content-Type，不是APPLICATION_URLENCODED则返回400 Bad Request
         if(req->content_type() != APPLICATION_URLENCODED){
@@ -224,22 +224,34 @@ void CloudiskServer::register_signup_module()
             return ;
         }
 
-        UserService::SRPCClient client{ inst.ip.c_str(), inst.port };
-        // 设置请求
+        auto* client = new UserService::SRPCClient{ inst.ip.c_str(), inst.port };
+
         UserRequest request;
         request.set_username(username);
         request.set_password(password);
-        // 同步调用
-        UserResponse response;
-        srpc::RPCSyncContext ctx;
-        client.sign_up(&request, &response, &ctx);
 
-        // 4. 返回响应 (统一 JSON 错误体, 前端 api.js 依赖 {"code","msg"})
-        if (ctx.success && response.success()) {
-            resp->String("SUCCESS");
-        } else {
-            ErrorUtil::send_error(resp, 400, rpc_err_msg(ctx, response, "注册失败，请稍后重试"));
-        }
+        // 同注册: RPC task 要挂到请求自己的 series 上, 详见 signin 处的说明
+        srpc::SRPCClientTask* task = client->create_sign_up_task(
+            [resp, client](UserResponse* response, srpc::RPCContext* ctx)
+            {
+                // 回调里绝不能抛异常出去: 穿过 workflow 回调会导致进程 terminate
+                try {
+                    if (ctx->success() && response->success()) {
+                        resp->String("SUCCESS");
+                    } else {
+                        // 统一 JSON 错误体, 前端 api.js 依赖 {"code","msg"}
+                        ErrorUtil::send_error(resp, 400,
+                            rpc_err_msg(ctx, *response, "注册失败，请稍后重试"));
+                    }
+                } catch (const std::exception& e) {
+                    cout << "[WARN] 注册回调异常: " << e.what() << endl;
+                    ErrorUtil::send_error(resp, 500);
+                }
+                delete client;
+            });
+
+        task->serialize_input(&request);
+        series->push_back(task);           // 入队即走, handler 不阻塞
     });
 }
 
@@ -274,29 +286,47 @@ void CloudiskServer::register_signin_module()
             ErrorUtil::send_error(resp, 503, "用户服务暂时不可用，请稍后重试");
             return ;
         }
-        UserService::SRPCClient client{ inst.ip.c_str(), inst.port };
-        // 设置请求
+        auto* client = new UserService::SRPCClient{ inst.ip.c_str(), inst.port };
+
         UserRequest request;
         request.set_username(username);
         request.set_password(password);
-        // 同步调用
-        UserResponse response;
-        srpc::RPCSyncContext ctx;
-        client.sign_in(&request, &response, &ctx);
 
-        // 4. 返回响应 (统一 JSON 错误体, 前端 api.js 依赖 {"code","msg"})
-        if (ctx.success && response.success()) {
-            nlohmann::json body;
-            body["Username"] = response.username();
-            body["Token"] = response.token();
-            body["Location"] = "/spa/";    /* 跳转到 SPA 首页 */
+        // 把 RPC task 挂到**请求自己的 series** 上, 而不是 client.sign_in(req, done)。
+        // 区别只在 task 归谁:
+        //   client.sign_in(req, done) 内部是 task->start()  —— task 自成一个 series,
+        //     handler 返回后请求 series 就空了、响应立刻发出, 回调再写 resp 已经晚了
+        //     (实测: 返回 HTTP 200 但响应体为空)
+        //   series->push_back(task)    —— task 属于请求的 series, series 不结束就不发响应,
+        //     回调里写 resp 是安全的
+        srpc::SRPCClientTask* task = client->create_sign_in_task(
+            [resp, client](UserResponse* response, srpc::RPCContext* ctx)
+            {
+                // 回调里绝不能抛异常出去: 穿过 workflow 回调会导致进程 terminate
+                try {
+                    if (ctx->success() && response->success()) {
+                        nlohmann::json body;
+                        body["Username"] = response->username();
+                        body["Token"]    = response->token();
+                        body["Location"] = "/spa/";    /* 跳转到 SPA 首页 */
 
-            nlohmann::json json;
-            json["data"] = body;
-            resp->String(json.dump());
-        } else {
-            ErrorUtil::send_error(resp, 400, rpc_err_msg(ctx, response, "用户名或密码错误"));
-        }
+                        nlohmann::json json;
+                        json["data"] = body;
+                        resp->String(json.dump());
+                    } else {
+                        // 统一 JSON 错误体, 前端 api.js 依赖 {"code","msg"}
+                        ErrorUtil::send_error(resp, 400,
+                            rpc_err_msg(ctx, *response, "用户名或密码错误"));
+                    }
+                } catch (const std::exception& e) {
+                    cout << "[WARN] 登录回调异常: " << e.what() << endl;
+                    ErrorUtil::send_error(resp, 500);
+                }
+                delete client;
+            });
+
+        task->serialize_input(&request);   // 请求被序列化进 task, 局部 request 可安全销毁
+        series->push_back(task);           // 入队即走, handler 不阻塞
     });
 }
 
