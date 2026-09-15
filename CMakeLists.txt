@@ -38,6 +38,7 @@ target_link_libraries(server PRIVATE
     curl
     pthread
     wfrest
+    hiredis                  # wfrest 的 resp->Redis 依赖
     SimpleAmqpClient
     srpc                     # 作为 RPC 客户端调用 UserService
     workflow

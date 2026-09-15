@@ -17,6 +17,9 @@ public:
     // 启动服务发现后台刷新 (定时从 Consul 拉 UserService 实例表)
     void start_service_discovery();
 
+    // 启动分片暂存区清理 (回收超期未完成的上传会话)
+    void start_chunk_sweep();
+
     int start(unsigned short port) { return m_server.start(port); }
 
     void stop() { m_server.stop(); }
@@ -38,6 +41,7 @@ private:
     void register_filedownload_module();
     void register_filedelete_module();
     void register_recycle_module();
+    void register_chunkupload_module();
 private:
 
     wfrest::HttpServer m_server {};

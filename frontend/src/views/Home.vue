@@ -141,18 +141,95 @@ async function loadFiles() {
   }
 }
 
+// 分片大小。超过这个尺寸走分片上传, 否则走原有的整文件上传。
+// 与后端约定一致即可, 后端从 init 参数里读。
+const CHUNK_SIZE = 5 * 1024 * 1024
+
+// 采样指纹: 文件名 + 大小 + 首尾各 1MB 一起做 SHA-256。
+//
+// 为什么不读整个文件算哈希: 2GB 文件要读若干秒, 用户会以为页面卡死。
+// 为什么不用随机 UUID: 那样换浏览器/清缓存就丢了, 本质上不是"续传"。
+// 采样指纹只有 2MB 的读取量, 且**由内容决定** —— 同一文件在任何设备
+// 算出的值相同, 所以断点续传真正可用。
+async function fileFingerprint(file) {
+  if (!window.crypto || !window.crypto.subtle) {
+    // crypto.subtle 只在安全上下文 (https 或 localhost) 可用。
+    // 非安全上下文下降级为随机标识: 仍能上传, 但刷新后无法续传。
+    console.warn('crypto.subtle 不可用, 降级为随机上传标识 (无法跨会话续传)')
+    return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+  }
+
+  const SAMPLE = 1024 * 1024
+  const head = await file.slice(0, SAMPLE).arrayBuffer()
+  const tail = await file.slice(Math.max(0, file.size - SAMPLE)).arrayBuffer()
+  const meta = new TextEncoder().encode(`${file.name}:${file.size}`)
+
+  const buf = new Uint8Array(head.byteLength + tail.byteLength + meta.byteLength)
+  buf.set(new Uint8Array(head), 0)
+  buf.set(new Uint8Array(tail), head.byteLength)
+  buf.set(meta, head.byteLength + tail.byteLength)
+
+  const digest = await crypto.subtle.digest('SHA-256', buf)
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 分片上传 + 断点续传
+async function doChunkedUpload(file) {
+  const uploadId = await fileFingerprint(file)
+
+  // init: 建会话并询问后端"传到哪了"
+  const init = unwrap(
+    await api.post(
+      '/file/upload/init',
+      formBody({
+        upload_id: uploadId,
+        filename: file.name,
+        size: file.size,
+        chunk_size: CHUNK_SIZE
+      })
+    )
+  )
+  const done = new Set(init.done || [])
+  const total = Math.ceil(file.size / CHUNK_SIZE)
+
+  if (done.size > 0 && done.size < total) {
+    ElMessage.info(`检测到未完成的上传，从 ${done.size}/${total} 片继续`)
+  }
+
+  let uploaded = done.size
+  uploadPercent.value = Math.round((uploaded / total) * 100)
+
+  // 只传缺失的分片 —— 断点续传就是这一行 if
+  for (let i = 0; i < total; i++) {
+    if (done.has(i)) continue
+    const fd = new FormData()
+    fd.append('upload_id', uploadId)
+    fd.append('index', i)
+    fd.append('chunk', file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE))
+    await api.post('/file/upload/chunk', fd)
+    uploaded++
+    uploadPercent.value = Math.round((uploaded / total) * 100)
+  }
+
+  await api.post('/file/upload/complete', formBody({ upload_id: uploadId }))
+}
+
 async function doUpload({ file }) {
   uploading.value = true
   uploadPercent.value = 0
-  const fd = new FormData()
-  fd.append('file', file)
   try {
-    // 不手动设 Content-Type，让 axios/浏览器自动带上 multipart boundary
-    await api.post('/file/upload', fd, {
-      onUploadProgress: (e) => {
-        if (e.total) uploadPercent.value = Math.round((e.loaded / e.total) * 100)
-      }
-    })
+    if (file.size > CHUNK_SIZE) {
+      await doChunkedUpload(file)
+    } else {
+      const fd = new FormData()
+      fd.append('file', file)
+      // 不手动设 Content-Type，让 axios/浏览器自动带上 multipart boundary
+      await api.post('/file/upload', fd, {
+        onUploadProgress: (e) => {
+          if (e.total) uploadPercent.value = Math.round((e.loaded / e.total) * 100)
+        }
+      })
+    }
     ElMessage.success(`${file.name} 上传成功`)
     loadFiles()
   } catch (err) {

@@ -5,9 +5,11 @@ sign_server
 
 # 敏感配置 (真实 AK/SK，勿提交；示例文件 OSS.env.example 需保留)
 OSS.env
+Redis.env
 
-# 运行时数据 (用户上传文件)
+# 运行时数据 (用户上传文件 / 分片暂存区)
 files/
+tmp/
 
 # 前端依赖与构建产物
 frontend/node_modules/
@@ -18,4 +20,3 @@ static/spa/
 *.swp
 .DS_Store
 ossbackup
-sign_server
