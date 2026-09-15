@@ -88,9 +88,20 @@ OSSManager::~OSSManager() = default;
 
 bool OSSManager::upload_file(const string& bucket, const string& object, const string& file) // 上传文件
 {
-    if (m_client == nullptr) return false;   // 配置不完整时构造失败
+    if (m_client == nullptr) {
+        cerr << "[OSS] 客户端未初始化 (OSS.env 配置不完整?)" << endl;
+        return false;
+    }
     auto outcome = m_client->PutObject(bucket, object, file);
-    return outcome.isSuccess();
+    if (!outcome.isSuccess()) {
+        // 打印具体原因。只返回 bool 的话, 调用方只能报 "upload failed",
+        // 分不清是本地文件不存在、桶名写错、还是 AK/SK 失效。
+        cerr << "[OSS] PutObject 失败: code=" << outcome.error().Code()
+             << ", msg=" << outcome.error().Message()
+             << ", bucket=" << bucket << ", object=" << object << endl;
+        return false;
+    }
+    return true;
 }
 
 bool OSSManager::upload_file(const string& bucket, const string& object, std::shared_ptr<std::iostream> content)
