@@ -20,10 +20,15 @@ export default defineConfig({
     }
   },
   server: {
-    // dev 模式 (npm run dev, 默认 5173 端口) 把 API 请求代理到 C++ 后端，免跨域
+    // 监听所有网卡: 默认只绑 127.0.0.1, 在远程/虚拟机开发时浏览器连不上
+    host: true,
+    // dev 模式把 API 请求代理到 C++ 后端, 免跨域。
+    // ⚠️ 新增后端路由时这里要同步加 —— 漏了的话该路由在 dev 模式下会 404,
+    //    但在生产 (走 8888) 却正常, 很容易查错方向。
     proxy: {
       '/user': 'http://localhost:8888',
-      '/file': 'http://localhost:8888'
+      '/file': 'http://localhost:8888',
+      '/dir':  'http://localhost:8888'
     }
   }
 })
