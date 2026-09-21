@@ -185,6 +185,7 @@ void CloudiskServer::register_modules()
     register_filedelete_module();
     register_recycle_module();
     register_chunkupload_module();
+    register_dir_module();
 }
 
 void CloudiskServer::register_static_resources_module()
@@ -1456,5 +1457,183 @@ static void chunk_sweep_timer_callback(WFTimerTask*)
 void CloudiskServer::start_chunk_sweep()
 {
     WFTaskFactory::create_timer_task(CHUNK_SWEEP_INTERVAL, 0, chunk_sweep_timer_callback)->start();
+}
+
+/*********************************************************************************
+ *                          文件目录                                             *
+ *********************************************************************************/
+// 根目录的固定表示。parent_id = 0 即根, 它不是一个真实节点。
+static const int ROOT_DIR_ID = 0;
+static const char* const ROOT_DIR_NAME = "全部文件";
+
+// 目录名合法性: 非空、不含路径分隔符与常见非法字符。
+// 前端也会校验, 但那只是体验优化 —— 后端必须独立校验。
+static bool valid_entry_name(const string& s)
+{
+    if (s.empty() || s.size() > 255) return false;
+    if (s == "." || s == "..") return false;
+    return s.find_first_of("/\\:*?\"<>|") == string::npos;
+}
+
+// 列目录回调: 先拿到 entries, 再拼面包屑 path
+static void dirlists_callback(HttpResp* resp, int uid, int parent_id, MySQLResultCursor* cursor)
+{
+    if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+        ErrorUtil::send_error(resp, 500);
+        return ;
+    }
+
+    nlohmann::json entries = nlohmann::json::array();
+    vector<MySQLCell> row;
+    while (cursor->fetch_row(row)) {
+        nlohmann::json e;
+        e["Id"]        = row[0].as_int();
+        e["Name"]      = row[1].as_string();
+        e["IsDir"]     = row[2].as_int();
+        // 目录没有 size/hashcode, 给默认值让前端无需判空
+        e["Size"]      = row[3].is_null() ? 0 : (long long)row[3].as_ulonglong();
+        e["UpdatedAt"] = row[4].as_datetime();
+        entries.push_back(std::move(e));
+    }
+
+    // 面包屑: 从根到当前。根目录 + 递归向上的结果。
+    // path 由后端算好 —— 前端自己维护"进入/返回"的栈, 遇到刷新页面、
+    // 浏览器前进后退、从搜索结果跳转都会错乱。
+    nlohmann::json path = nlohmann::json::array();
+    path.push_back({{"id", ROOT_DIR_ID}, {"name", ROOT_DIR_NAME}});
+
+    if (parent_id == ROOT_DIR_ID) {
+        nlohmann::json out;
+        out["path"] = path;
+        out["entries"] = entries;
+        resp->String(out.dump());
+        return ;
+    }
+
+    // 递归向上取祖先链 (含自身), 由根到当前
+    string sql =
+        "WITH RECURSIVE up AS ("
+        "  SELECT id, parent_id, name, 0 AS lvl FROM tbl_node"
+        "   WHERE id = " + std::to_string(parent_id) + " AND uid = " + std::to_string(uid)
+        + " AND is_dir = 1 AND status = 0"
+        "  UNION ALL"
+        "  SELECT n.id, n.parent_id, n.name, up.lvl + 1 FROM tbl_node n"
+        "   JOIN up ON n.id = up.parent_id WHERE n.uid = " + std::to_string(uid)
+        + ")"
+        " SELECT id, name FROM up ORDER BY lvl DESC";
+
+    resp->MySQL(MYSQL_URL, sql, [resp, entries, path](MySQLResultCursor* cur) mutable
+    {
+        if (cur->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+            ErrorUtil::send_error(resp, 500);
+            return ;
+        }
+        vector<MySQLCell> r;
+        while (cur->fetch_row(r))
+            path.push_back({{"id", r[0].as_int()}, {"name", r[1].as_string()}});
+
+        nlohmann::json out;
+        out["path"] = path;
+        out["entries"] = entries;
+        resp->String(out.dump());
+    });
+}
+
+void CloudiskServer::register_dir_module()
+{
+    // ============ 列目录 ============
+    m_server.POST("/dir/list", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        string pid_str = form_get(req->form_kv(), "parent_id");
+        if (pid_str.empty()) pid_str = "0";     // 默认根目录
+        if (pid_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+        int parent_id = 0;
+        try { parent_id = std::stoi(pid_str); }
+        catch (const std::exception&) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+
+        // 目录置顶, 同级按名称排序 —— 网盘界面的惯例
+        string sql = "SELECT id, name, is_dir, size, updated_at FROM tbl_node "
+            "WHERE uid = " + std::to_string(user.id)
+            + " AND parent_id = " + std::to_string(parent_id)
+            + " AND status = 0 ORDER BY is_dir DESC, name";
+
+        resp->MySQL(MYSQL_URL, sql,
+            std::bind(dirlists_callback, resp, user.id, parent_id, _1));
+    });
+
+    // ============ 新建目录 ============
+    m_server.POST("/dir/create", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        map<string, string>& data = req->form_kv();
+        string pid_str = form_get(data, "parent_id");
+        string name    = form_get(data, "name");
+        if (pid_str.empty()) pid_str = "0";
+        if (pid_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+        if (!valid_entry_name(name)) {
+            ErrorUtil::send_error(resp, 400, "目录名不合法");
+            return ;
+        }
+
+        // ⚠️ 必须先校验 parent_id 归属。
+        // 否则任何登录用户都能拿别人的目录 id 当 parent_id, 在别人目录里建东西。
+        // (与分片上传的越权写入是同一类问题 —— 绝不信任客户端传入的归属信息)
+        string check = "SELECT 1 FROM tbl_node WHERE id = " + pid_str
+            + " AND uid = " + std::to_string(user.id) + " AND is_dir = 1 AND status = 0";
+
+        resp->MySQL(MYSQL_URL, check, [resp, user, pid_str, name](MySQLResultCursor* c0)
+        {
+            bool is_root = (pid_str == "0");
+            bool ok = (c0->get_cursor_status() == MYSQL_STATUS_GET_RESULT);
+            vector<MySQLCell> row;
+            if (ok && !is_root && !c0->fetch_row(row)) {
+                // 指定了父目录, 但它不存在或不属于当前用户
+                ErrorUtil::send_error(resp, 404, "目标目录不存在");
+                return ;
+            }
+            if (!ok) {
+                ErrorUtil::send_error(resp, 500);
+                return ;
+            }
+
+            // 唯一键 uk_uid_parent_name 会拦截同目录重名, 冲突时由 1062 区分,
+            // 无需在应用层再查一次
+            string sql = "INSERT INTO tbl_node (uid, parent_id, name, is_dir) VALUES ("
+                + std::to_string(user.id) + ", " + pid_str + ", "
+                + sql_quote(name) + ", 1)";
+
+            resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+            {
+                if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+                    // 1062 = ER_DUP_ENTRY: 同目录下已有同名条目
+                    ErrorUtil::send_error(resp, 400, "该目录下已存在同名文件或文件夹");
+                    return ;
+                }
+                resp->String(R"({"code":0,"msg":"SUCCESS"})");
+            });
+        });
+    });
 }
 

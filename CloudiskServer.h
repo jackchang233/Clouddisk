@@ -42,6 +42,7 @@ private:
     void register_filedelete_module();
     void register_recycle_module();
     void register_chunkupload_module();
+    void register_dir_module();
 private:
 
     wfrest::HttpServer m_server {};
