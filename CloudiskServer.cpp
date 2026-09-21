@@ -91,6 +91,49 @@ static string form_get(const map<string, string>& kv, const string& key)
     return it == kv.end() ? string() : CodeUtil::url_decode(it->second);
 }
 
+// 校验 parent_id 归属, 通过后执行 next。
+//
+// ⚠️ 为什么必须显式校验: 客户端传来的 parent_id 是**别人的目录 id** 时,
+// INSERT 语句里 uid 是自己的、parent_id 是别人的 —— 两个字段各自合法,
+// 组合起来就是越权。数据库约束(唯一键/外键)拦不住这种情况。
+//
+// 读操作不需要这层保护, 因为查询条件里带了 uid 过滤; 写操作没有兜底,
+// 必须自己查。**读的安全来自查询条件, 写的安全必须显式校验。**
+//
+// parent_id = 0 表示根目录, 它不是真实节点, 直接放行。
+static void with_valid_parent(HttpResp* resp, int uid, const string& pid_str,
+                              std::function<void()> next)
+{
+    if (pid_str == "0") { next(); return; }
+
+    string sql = "SELECT 1 FROM tbl_node WHERE id = " + pid_str
+        + " AND uid = " + std::to_string(uid) + " AND is_dir = 1 AND status = 0";
+
+    resp->MySQL(MYSQL_URL, sql, [resp, next](MySQLResultCursor* cursor)
+    {
+        if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+            ErrorUtil::send_error(resp, 500);
+            return ;
+        }
+        vector<MySQLCell> row;
+        if (!cursor->fetch_row(row)) {
+            ErrorUtil::send_error(resp, 404, "目标目录不存在");
+            return ;
+        }
+        next();
+    });
+}
+
+// 解析 parent_id 参数: 缺省为 0(根目录); 非纯数字返回 -1 表示非法
+static int parse_parent_id(const string& s)
+{
+    if (s.empty()) return 0;
+    if (s.find_first_not_of("0123456789") != string::npos) return -1;
+    try { return std::stoi(s); }
+    catch (const std::exception&) { return -1; }
+}
+
+
 // 清理「引用计数归零且已无人引用」的内容池行。
 //
 // 为什么需要它: 覆盖上传时旧内容的 refcnt 减到 0, 但递减语句本身不会删行;
@@ -409,17 +452,30 @@ void CloudiskServer::register_fileupload_module()
             ErrorUtil::send_error(resp, 400);
             return;
         }
-        // TODO: 4. 处理文件: 遍历 req->form()
-        //          (Form = map<string, pair<filename, content>>，用结构化绑定取出)
-        //          - CryptoUtil::generate_hashcode 计算文件哈希
-        //          - 为每个用户单独创建文件夹 files/<username>/
-        //            (access + F_OK 判断是否存在，不存在则 mkdir)
-        //          - open(O_WRONLY|O_CREAT|O_TRUNC) / write / close 写入文件
-        //          - [OSS备份]
-        
+        // 目标目录: multipart 里的普通字段 (非文件部分)
+        string pid_str = "0";
+        {
+            Form& form = req->form();
+            auto it = form.find("parent_id");
+            if (it != form.end()) pid_str = it->second.second;
+        }
+        if (parse_parent_id(pid_str) < 0) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+
+        // 校验 parent_id 归属后再处理文件。
+        // 捕获 req 指针而非 form 引用 —— 回调在 handler 返回后才执行,
+        // req 由 series 保活, 引用 local 变量则可能悬垂。
+        with_valid_parent(resp, user.id, pid_str,
+            [resp, req, user, username, pid_str]()
+        {
         Form& form = req->form();
         for (const auto& [_,file] : form){
             const auto& [filename,content] = file;
+            // multipart 里的普通字段(parent_id 等) filename 为空,
+            // 它们不是文件, 跳过 —— 否则会被当文件写到磁盘上
+            if (filename.empty()) continue;
             string hashcode = CryptoUtil::generate_hashcode(content.c_str(),content.size());
             string directory = "files/" + username +"/";
             if(access(directory.c_str(),F_OK)){
@@ -465,11 +521,11 @@ void CloudiskServer::register_fileupload_module()
             string unref_old = "UPDATE tbl_blob b JOIN tbl_node n ON n.hashcode = b.hashcode "
                 "SET b.refcnt = b.refcnt - 1 "
                 "WHERE n.uid = " + std::to_string(user.id)
-                + " AND n.parent_id = 0 AND n.is_dir = 0 AND n.name = " + sql_quote(filename)
+                + " AND n.parent_id = " + pid_str + " AND n.is_dir = 0 AND n.name = " + sql_quote(filename)
                 + " AND n.hashcode <> " + sql_quote(hashcode);
 
             resp->MySQL(MYSQL_URL, unref_old,
-                [resp, user, filename, hashcode, size_s](MySQLResultCursor* c1)
+                [resp, user, filename, hashcode, size_s, pid_str](MySQLResultCursor* c1)
             {
                 if (c1->get_cursor_status() != MYSQL_STATUS_OK) {
                     ErrorUtil::send_error(resp, 500);
@@ -480,7 +536,7 @@ void CloudiskServer::register_fileupload_module()
                     "ON DUPLICATE KEY UPDATE refcnt = refcnt + 1";
 
                 resp->MySQL(MYSQL_URL, upsert_blob,
-                    [resp, user, filename, hashcode, size_s](MySQLResultCursor* c2)
+                    [resp, user, filename, hashcode, size_s, pid_str](MySQLResultCursor* c2)
                 {
                     if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
                         ErrorUtil::send_error(resp, 500);
@@ -488,7 +544,8 @@ void CloudiskServer::register_fileupload_module()
                     }
                     string upsert_node = "INSERT INTO tbl_node "
                         "(uid, parent_id, name, is_dir, hashcode, size) VALUES ("
-                        + std::to_string(user.id) + ", 0, " + sql_quote(filename) + ", 0, "
+                        + std::to_string(user.id) + ", " + pid_str + ", "
+                        + sql_quote(filename) + ", 0, "
                         + sql_quote(hashcode) + ", " + size_s + ") "
                         "ON DUPLICATE KEY UPDATE hashcode = VALUES(hashcode), "
                         "size = VALUES(size), status = 0, deleted_at = NULL";
@@ -506,6 +563,7 @@ void CloudiskServer::register_fileupload_module()
                 });
             });
         }
+        });   // ← with_valid_parent 的回调
     });
 }
 
@@ -1054,6 +1112,13 @@ void CloudiskServer::register_chunkupload_module()
         string filename  = form_get(data, "filename");
         string size_str  = form_get(data, "size");
         string chunk_str = form_get(data, "chunk_size");
+        // 目标目录。必须存进会话 —— 否则中断续传后会忘记原本要传到哪个目录
+        string pid_str   = form_get(data, "parent_id");
+        if (parse_parent_id(pid_str) < 0) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+        if (pid_str.empty()) pid_str = "0";
 
         if (!valid_upload_id(upload_id)) {
             ErrorUtil::send_error(resp, 400, "无效的上传标识");
@@ -1093,8 +1158,14 @@ void CloudiskServer::register_chunkupload_module()
         string sel = "SELECT 1 FROM tbl_upload WHERE uid = " + std::to_string(user.id)
             + " AND upload_id = " + sql_quote(upload_id);
 
+        // ⚠️ 归属校验: init 存下的 parent_id 会在 complete 时用于建节点。
+        // 不校验的话, 攻击者可借分片上传在别人的目录里创建文件
+        // (整文件上传有 with_valid_parent 保护, 分片这条路径当时漏了)
+        with_valid_parent(resp, user.id, pid_str,
+            [resp, upload_id, user, filename, size_str, chunk_str, total_chunks, pid_str, sel]()
+        {
         resp->MySQL(MYSQL_URL, sel,
-            [resp, upload_id, user, filename, size_str, chunk_str, total_chunks]
+            [resp, upload_id, user, filename, size_str, chunk_str, total_chunks, pid_str]
             (MySQLResultCursor* cursor)
         {
             if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
@@ -1110,8 +1181,8 @@ void CloudiskServer::register_chunkupload_module()
 
             // 不存在 -> 建会话
             string ins = "INSERT INTO tbl_upload "
-                "(upload_id, uid, filename, total_size, chunk_size, total_chunks) VALUES ("
-                + sql_quote(upload_id) + ", " + std::to_string(user.id) + ", "
+                "(upload_id, uid, parent_id, filename, total_size, chunk_size, total_chunks) VALUES ("
+                + sql_quote(upload_id) + ", " + std::to_string(user.id) + ", " + pid_str + ", "
                 + sql_quote(filename) + ", " + size_str + ", " + chunk_str + ", "
                 + std::to_string(total_chunks) + ")";
 
@@ -1124,6 +1195,7 @@ void CloudiskServer::register_chunkupload_module()
                 reply_done_chunks(resp, user.id, upload_id);   // 新会话, done 为空
             });
         });
+        });   // ← with_valid_parent 的回调
     });
 
     // ============ chunk: 收单个分片 ============
@@ -1243,7 +1315,7 @@ void CloudiskServer::register_chunkupload_module()
             return ;
         }
 
-        string sel = "SELECT filename, total_size, total_chunks FROM tbl_upload WHERE upload_id = "
+        string sel = "SELECT filename, total_size, total_chunks, parent_id FROM tbl_upload WHERE upload_id = "
             + sql_quote(upload_id) + " AND uid = " + std::to_string(user.id) + " AND status = 0";
 
         resp->MySQL(MYSQL_URL, sel,
@@ -1261,6 +1333,7 @@ void CloudiskServer::register_chunkupload_module()
             string filename   = row[0].as_string();
             long long total   = row[1].as_ulonglong();
             int total_chunks  = row[2].as_int();
+            string pid_str    = std::to_string(row[3].as_int());
 
             string dir = chunk_dir(user.id, upload_id);
             string directory = "files/" + user.username + "/";
@@ -1331,11 +1404,11 @@ void CloudiskServer::register_chunkupload_module()
             string unref_old = "UPDATE tbl_blob b JOIN tbl_node n ON n.hashcode = b.hashcode "
                 "SET b.refcnt = b.refcnt - 1 "
                 "WHERE n.uid = " + std::to_string(user.id)
-                + " AND n.parent_id = 0 AND n.is_dir = 0 AND n.name = " + sql_quote(base_name)
+                + " AND n.parent_id = " + pid_str + " AND n.is_dir = 0 AND n.name = " + sql_quote(base_name)
                 + " AND n.hashcode <> " + sql_quote(hashcode);
 
             resp->MySQL(MYSQL_URL, unref_old,
-                [resp, upload_id, user, filepath, hashcode, base_name, merged_s, merged]
+                [resp, upload_id, user, filepath, hashcode, base_name, merged_s, merged, pid_str]
                 (MySQLResultCursor* c0)
             {
               if (c0->get_cursor_status() != MYSQL_STATUS_OK) {
@@ -1347,7 +1420,7 @@ void CloudiskServer::register_chunkupload_module()
                   "ON DUPLICATE KEY UPDATE refcnt = refcnt + 1";
 
               resp->MySQL(MYSQL_URL, upsert_blob,
-                [resp, upload_id, user, filepath, hashcode, base_name, merged_s, merged]
+                [resp, upload_id, user, filepath, hashcode, base_name, merged_s, merged, pid_str]
                 (MySQLResultCursor* c1)
               {
                 if (c1->get_cursor_status() != MYSQL_STATUS_OK) {
@@ -1356,7 +1429,7 @@ void CloudiskServer::register_chunkupload_module()
                 }
                 string upsert_node = "INSERT INTO tbl_node "
                     "(uid, parent_id, name, is_dir, hashcode, size) VALUES ("
-                    + std::to_string(user.id) + ", 0, " + sql_quote(base_name) + ", 0, "
+                    + std::to_string(user.id) + ", " + pid_str + ", " + sql_quote(base_name) + ", 0, "
                     + sql_quote(hashcode) + ", " + merged_s + ") "
                     "ON DUPLICATE KEY UPDATE hashcode = VALUES(hashcode), "
                     "size = VALUES(size), status = 0, deleted_at = NULL";
@@ -1597,27 +1670,15 @@ void CloudiskServer::register_dir_module()
             return ;
         }
 
-        // ⚠️ 必须先校验 parent_id 归属。
-        // 否则任何登录用户都能拿别人的目录 id 当 parent_id, 在别人目录里建东西。
-        // (与分片上传的越权写入是同一类问题 —— 绝不信任客户端传入的归属信息)
-        string check = "SELECT 1 FROM tbl_node WHERE id = " + pid_str
-            + " AND uid = " + std::to_string(user.id) + " AND is_dir = 1 AND status = 0";
+        if (parse_parent_id(pid_str) < 0) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
 
-        resp->MySQL(MYSQL_URL, check, [resp, user, pid_str, name](MySQLResultCursor* c0)
+        // ⚠️ 先校验 parent_id 归属, 否则任何登录用户都能拿别人的目录 id
+        // 在别人目录里建东西 (见 with_valid_parent 注释)
+        with_valid_parent(resp, user.id, pid_str, [resp, user, pid_str, name]()
         {
-            bool is_root = (pid_str == "0");
-            bool ok = (c0->get_cursor_status() == MYSQL_STATUS_GET_RESULT);
-            vector<MySQLCell> row;
-            if (ok && !is_root && !c0->fetch_row(row)) {
-                // 指定了父目录, 但它不存在或不属于当前用户
-                ErrorUtil::send_error(resp, 404, "目标目录不存在");
-                return ;
-            }
-            if (!ok) {
-                ErrorUtil::send_error(resp, 500);
-                return ;
-            }
-
             // 唯一键 uk_uid_parent_name 会拦截同目录重名, 冲突时由 1062 区分,
             // 无需在应用层再查一次
             string sql = "INSERT INTO tbl_node (uid, parent_id, name, is_dir) VALUES ("
