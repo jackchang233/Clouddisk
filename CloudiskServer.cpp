@@ -1612,6 +1612,24 @@ static void dirlists_callback(HttpResp* resp, int uid, int parent_id, MySQLResul
     });
 }
 
+// 执行移动。调用前必须已完成: 节点归属校验 + 目标目录归属校验 + (目录的)环检测。
+static void perform_move(HttpResp* resp, int uid, const string& id_str, const string& pid_str)
+{
+    string sql = "UPDATE tbl_node SET parent_id = " + pid_str
+        + " WHERE id = " + id_str + " AND uid = " + std::to_string(uid)
+        + " AND status = 0";
+
+    resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+    {
+        if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+            // 1062: 目标目录下已有同名条目
+            ErrorUtil::send_error(resp, 400, "目标目录下已存在同名文件或文件夹");
+            return ;
+        }
+        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+    });
+}
+
 void CloudiskServer::register_dir_module()
 {
     // ============ 列目录 ============
@@ -1693,6 +1711,132 @@ void CloudiskServer::register_dir_module()
                     return ;
                 }
                 resp->String(R"({"code":0,"msg":"SUCCESS"})");
+            });
+        });
+    });
+
+    // ============ 重命名 ============
+    m_server.POST("/dir/rename", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        map<string, string>& data = req->form_kv();
+        string id_str = form_get(data, "id");
+        string name   = form_get(data, "name");
+        if (id_str.empty() || id_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的节点ID");
+            return ;
+        }
+        if (!valid_entry_name(name)) {
+            ErrorUtil::send_error(resp, 400, "名称不合法");
+            return ;
+        }
+
+        // 归属由 WHERE uid = ? 保证 —— 改不到别人的节点
+        string sql = "UPDATE tbl_node SET name = " + sql_quote(name)
+            + " WHERE id = " + id_str + " AND uid = " + std::to_string(user.id)
+            + " AND status = 0";
+
+        resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+        {
+            if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+                // 1062: 同目录下已有同名条目
+                ErrorUtil::send_error(resp, 400, "该目录下已存在同名文件或文件夹");
+                return ;
+            }
+            // ⚠️ 归属只靠 WHERE uid 保证, 影响了 0 行说明该节点不存在或不属于当前用户。
+            // 不检查的话会返回 SUCCESS 但实际什么都没改 —— 响应在说谎。
+            // (修复前的实测: 攻击者重命名别人的节点, 返回 SUCCESS, 名称却没变)
+            if (cursor->get_affected_rows() == 0) {
+                ErrorUtil::send_error(resp, 404, "节点不存在");
+                return ;
+            }
+            resp->String(R"({"code":0,"msg":"SUCCESS"})");
+        });
+    });
+
+    // ============ 移动 ============
+    m_server.POST("/dir/move", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        map<string, string>& data = req->form_kv();
+        string id_str = form_get(data, "id");
+        string pid_str = form_get(data, "parent_id");
+        if (id_str.empty() || id_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的节点ID");
+            return ;
+        }
+        if (parse_parent_id(pid_str) < 0) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+        if (pid_str.empty()) pid_str = "0";
+        // 移到自身下无意义, 且会让下面的环检测误判为目标非法
+        if (id_str == pid_str) {
+            ErrorUtil::send_error(resp, 400, "不能移动到自身");
+            return ;
+        }
+
+        // ① 先确认被移动的节点属于当前用户, 并取出 is_dir
+        string sel = "SELECT is_dir FROM tbl_node WHERE id = " + id_str
+            + " AND uid = " + std::to_string(user.id) + " AND status = 0";
+
+        resp->MySQL(MYSQL_URL, sel,
+            [resp, user, id_str, pid_str](MySQLResultCursor* c0)
+        {
+            if (c0->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+                ErrorUtil::send_error(resp, 500);
+                return ;
+            }
+            vector<MySQLCell> row;
+            if (!c0->fetch_row(row)) {
+                ErrorUtil::send_error(resp, 404, "节点不存在");
+                return ;
+            }
+            int is_dir = row[0].as_int();
+
+            // ② 目标目录必须属于当前用户
+            with_valid_parent(resp, user.id, pid_str,
+                [resp, user, id_str, pid_str, is_dir]()
+            {
+                // ③ 环检测: 仅目录需要 —— 把 /docs 移进 /docs/2024 会让整棵树从根断开。
+                //    用递归 CTE 取被移动节点的整棵子树, 看目标目录是否在其中。
+                if (is_dir == 0) { perform_move(resp, user.id, id_str, pid_str); return ; }
+
+                string sql =
+                    "WITH RECURSIVE subtree AS ("
+                    "  SELECT id FROM tbl_node WHERE id = " + id_str
+                    + " AND uid = " + std::to_string(user.id)
+                    + "  UNION ALL"
+                    "  SELECT n.id FROM tbl_node n JOIN subtree s ON n.parent_id = s.id"
+                    + " WHERE n.uid = " + std::to_string(user.id)
+                    + ") SELECT id FROM subtree WHERE id = " + pid_str;
+
+                resp->MySQL(MYSQL_URL, sql, [resp, user, id_str, pid_str](MySQLResultCursor* c1)
+                {
+                    if (c1->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+                        ErrorUtil::send_error(resp, 500);
+                        return ;
+                    }
+                    vector<MySQLCell> r;
+                    if (c1->fetch_row(r)) {
+                        // 目标目录在被移动节点的子树里 —— 会成环
+                        ErrorUtil::send_error(resp, 400, "不能把目录移动到它自己的子目录下");
+                        return ;
+                    }
+                    perform_move(resp, user.id, id_str, pid_str);
+                });
             });
         });
     });
