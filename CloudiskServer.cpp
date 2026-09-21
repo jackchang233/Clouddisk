@@ -714,9 +714,34 @@ void delete_callback(HttpResp* resp, string id_str, int uid, MySQLResultCursor* 
         return;
     }
 
-    // 软删: 只改 status 并记录删除时间，行和物理文件都保留，可进回收站、可恢复
-    string sql = "UPDATE tbl_node SET status = 1, deleted_at = NOW() WHERE id = " + id_str
-        + " AND uid = " + std::to_string(uid);
+    int is_dir = record[1].as_int();
+
+    // 软删: 只改 status, 行和物理文件都保留, 可进回收站、可恢复。
+    //
+    // 文件: 只标记自己。
+    // 目录: **级联标记整棵子树** —— 否则删了目录, 里面的文件还留在列表里可见。
+    //
+    // `deleted_by_cascade` 区分两种删除: 目录本身 = 0, 被带着删的后代 = 1。
+    // 恢复时只还原后者 —— 用户如果先单独删过某个子文件, 那个不该被"复活"。
+    //
+    // 两条语句都带 `AND status = 0`: 已在回收站里的节点不重复标记,
+    // 否则会把它的 deleted_by_cascade 覆盖掉, 丢失"是用户单独删的"这个信息。
+    string sql;
+    if (is_dir) {
+        sql = "WITH RECURSIVE subtree AS ("
+              "  SELECT id FROM tbl_node WHERE id = " + id_str
+              + " AND uid = " + std::to_string(uid)
+              + "  UNION ALL"
+              "  SELECT n.id FROM tbl_node n JOIN subtree s ON n.parent_id = s.id"
+              "   WHERE n.uid = " + std::to_string(uid)
+              + ") UPDATE tbl_node SET status = 1, deleted_at = NOW(),"
+              "  deleted_by_cascade = IF(id = " + id_str + ", 0, 1)"
+              " WHERE id IN (SELECT id FROM subtree) AND status = 0";
+    } else {
+        sql = "UPDATE tbl_node SET status = 1, deleted_at = NOW(), deleted_by_cascade = 0"
+              " WHERE id = " + id_str + " AND uid = " + std::to_string(uid)
+              + " AND status = 0";
+    }
 
     resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
     {
@@ -747,8 +772,8 @@ void CloudiskServer::register_filedelete_module()
             return;
         }
 
-        // 先查文件名(校验归属 uid + 未删除 status=0)，拿不到就 404
-        string sql = "SELECT name FROM tbl_node WHERE id = " + id_str
+        // 先查名称与类型(校验归属 uid + 未删除 status=0)，拿不到就 404
+        string sql = "SELECT name, is_dir FROM tbl_node WHERE id = " + id_str
             + " AND uid = " + std::to_string(user.id) + " AND status = 0";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(delete_callback, resp, id_str, user.id, _1));
@@ -771,16 +796,47 @@ void restore_callback(HttpResp* resp, string id_str, int uid, MySQLResultCursor*
         return;
     }
 
-    string sql = "UPDATE tbl_node SET status = 0, deleted_at = NULL WHERE id = " + id_str
-        + " AND uid = " + std::to_string(uid);
+    int is_dir = record[1].as_int();
 
-    resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+    // 恢复: 自己 + (目录的)被级联删掉的后代。
+    //
+    // 只还原 `deleted_by_cascade = 1` 的后代 —— 用户如果**先单独删过**某个子节点,
+    // 它的标记是 0, 不该因为恢复父目录而被"复活"。
+    // 这是 deleted_by_cascade 这一列存在的全部理由。
+    string self_sql = "UPDATE tbl_node SET status = 0, deleted_at = NULL, deleted_by_cascade = 0"
+        " WHERE id = " + id_str + " AND uid = " + std::to_string(uid) + " AND status = 1";
+
+    // 分两步执行(不能用多语句: workflow 的 MySQL 走文本协议, 未开
+    // CLIENT_MULTI_STATEMENTS)。第二步只还原被级联删的后代。
+    resp->MySQL(MYSQL_URL, self_sql, [resp, id_str, uid, is_dir](MySQLResultCursor* c1)
     {
-        if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+        if (c1->get_cursor_status() != MYSQL_STATUS_OK) {
             ErrorUtil::send_error(resp, 500);
             return;
         }
-        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+        if (!is_dir) {
+            resp->String(R"({"code":0,"msg":"SUCCESS"})");
+            return;
+        }
+
+        string cascade =
+            "WITH RECURSIVE subtree AS ("
+            "  SELECT id FROM tbl_node WHERE id = " + id_str
+            + " AND uid = " + std::to_string(uid)
+            + "  UNION ALL"
+            "  SELECT n.id FROM tbl_node n JOIN subtree s ON n.parent_id = s.id"
+            "   WHERE n.uid = " + std::to_string(uid)
+            + ") UPDATE tbl_node SET status = 0, deleted_at = NULL, deleted_by_cascade = 0"
+            " WHERE id IN (SELECT id FROM subtree) AND deleted_by_cascade = 1";
+
+        resp->MySQL(MYSQL_URL, cascade, [resp](MySQLResultCursor* c2)
+        {
+            if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
+                ErrorUtil::send_error(resp, 500);
+                return;
+            }
+            resp->String(R"({"code":0,"msg":"SUCCESS"})");
+        });
     });
 }
 
@@ -796,44 +852,64 @@ void purge_callback(HttpResp* resp, string directory, string id_str, int uid, My
         ErrorUtil::send_error(resp, 404, "文件不存在");
         return;
     }
-    string filename = record[0].as_string();
-    string hashcode = record[1].as_string();
-    string filepath = directory + PathUtil::base(filename);
 
-    string sql = "DELETE FROM tbl_node WHERE id = " + id_str
-        + " AND uid = " + std::to_string(uid);
+    // 彻底删除是**级联**的: 目录要连同整棵子树一起删。
+    // 对文件而言, 子树就是它自己 —— 统一走同一条路, 不需要分支。
+    //
+    // 顺序不能颠倒: 递减引用计数依赖子树的节点还在, 所以必须先递减、
+    // 后删节点 (与覆盖上传里"先 unref 旧的再改节点"是同一个道理)。
+    string subtree =
+        "(WITH RECURSIVE subtree AS ("
+        "  SELECT id FROM tbl_node WHERE id = " + id_str + " AND uid = " + std::to_string(uid)
+        + "  UNION ALL"
+        "  SELECT n.id FROM tbl_node n JOIN subtree s ON n.parent_id = s.id"
+        "   WHERE n.uid = " + std::to_string(uid)
+        + ") SELECT id FROM subtree)";
 
-    resp->MySQL(MYSQL_URL, sql, [resp, filepath, hashcode](MySQLResultCursor* cursor)
+    // ① 取出子树里的所有文件: 用于删物理文件
+    string sel_files = "SELECT name FROM tbl_node WHERE id IN " + subtree + " AND is_dir = 0";
+
+    resp->MySQL(MYSQL_URL, sel_files,
+        [resp, directory, id_str, uid, subtree](MySQLResultCursor* c0)
     {
-        if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+        if (c0->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
             ErrorUtil::send_error(resp, 500);
-            return;
+            return ;
         }
-        // 节点已删除 -> 递减内容池引用。
-        // (物理文件仍按节点路径删, 因为暂未做内容寻址; 等物理存储改成 blobs/<hash>
-        //  之后, unlink 必须改成「refcnt 归零才删」)
-        string unref = "UPDATE tbl_blob SET refcnt = refcnt - 1 WHERE hashcode = "
-            + sql_quote(hashcode);
+        vector<string> paths;
+        vector<MySQLCell> r;
+        while (c0->fetch_row(r))
+            paths.push_back(directory + PathUtil::base(r[0].as_string()));
 
-        resp->MySQL(MYSQL_URL, unref, [resp, filepath, hashcode](MySQLResultCursor* c2)
+        // ② 按子树内每个 hashcode 的出现次数批量递减引用计数
+        string unref =
+            "UPDATE tbl_blob b JOIN ("
+            "  SELECT hashcode, COUNT(*) AS cnt FROM tbl_node"
+            "   WHERE id IN " + subtree + " AND is_dir = 0 AND hashcode IS NOT NULL"
+            "   GROUP BY hashcode"
+            ") t ON b.hashcode = t.hashcode"
+            " SET b.refcnt = b.refcnt - t.cnt";
+
+        resp->MySQL(MYSQL_URL, unref,
+            [resp, id_str, uid, subtree, paths](MySQLResultCursor* c1)
         {
-            if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
+            if (c1->get_cursor_status() != MYSQL_STATUS_OK) {
                 ErrorUtil::send_error(resp, 500);
-                return;
+                return ;
             }
-            // refcnt 归零才清掉 blob 行
-            string clean = "DELETE FROM tbl_blob WHERE hashcode = " + sql_quote(hashcode)
-                + " AND refcnt <= 0";
+            // ③ 删除子树的所有节点
+            string del = "DELETE FROM tbl_node WHERE id IN " + subtree;
 
-            resp->MySQL(MYSQL_URL, clean, [resp, filepath](MySQLResultCursor* c3)
+            resp->MySQL(MYSQL_URL, del, [resp, paths](MySQLResultCursor* c2)
             {
-                if (c3->get_cursor_status() != MYSQL_STATUS_OK) {
+                if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
                     ErrorUtil::send_error(resp, 500);
-                    return;
+                    return ;
                 }
-                // 删行成功后尽力删物理文件: 失败只留下孤儿文件(无害)，不阻断响应
-                if (unlink(filepath.c_str()) != 0) {
-                    std::cout << "[WARN] 物理文件删除失败: " << filepath << endl;
+                // ④ 删物理文件 (尽力而为; 失败留孤儿文件, 无害)
+                for (const string& p : paths) {
+                    if (unlink(p.c_str()) != 0)
+                        std::cout << "[WARN] 物理文件删除失败: " << p << std::endl;
                 }
                 sweep_unreferenced_blobs();
                 resp->String(R"({"code":0,"msg":"SUCCESS"})");
@@ -855,7 +931,8 @@ void recyclelist_callback(HttpResp* resp, MySQLResultCursor* cursor)
         nlohmann::json file;
         file["Id"] = record[0].as_int();
         file["FileName"] = record[1].as_string();
-        file["FileSize"] = record[2].as_ulonglong();
+        // 目录没有 size, 给 0 让前端无需判空
+        file["FileSize"] = record[2].is_null() ? 0 : (long long)record[2].as_ulonglong();
         file["DeletedAt"] = record[3].as_datetime();
         result.push_back(std::move(file));
     }
@@ -873,8 +950,12 @@ void CloudiskServer::register_recycle_module()
             ErrorUtil::send_error(resp, 401);
             return;
         }
+        // 只列**用户直接删除**的节点 (deleted_by_cascade = 0)。
+        // 若把被级联删的后代也列出来, 删一个文件夹会在回收站里冒出它内部的
+        // 所有文件 —— 既重复又困惑, 还会让用户单独恢复子文件却丢了父目录。
+        // 同时不再过滤 is_dir: 目录本身也要能在这里恢复。
         string sql = "SELECT id, name AS filename, size, deleted_at FROM tbl_node WHERE uid = "
-            + std::to_string(user.id) + " AND is_dir = 0 AND status = 1";
+            + std::to_string(user.id) + " AND status = 1 AND deleted_by_cascade = 0";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(recyclelist_callback, resp, _1));
     });
@@ -895,7 +976,7 @@ void CloudiskServer::register_recycle_module()
             return;
         }
 
-        string sql = "SELECT name FROM tbl_node WHERE id = " + id_str
+        string sql = "SELECT name, is_dir FROM tbl_node WHERE id = " + id_str
             + " AND uid = " + std::to_string(user.id) + " AND status = 1";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(restore_callback, resp, id_str, user.id, _1));
@@ -919,7 +1000,7 @@ void CloudiskServer::register_recycle_module()
 
         string directory = "files/" + user.username + "/";
         // 一并取出 hashcode —— 彻底删除时要递减内容池的引用计数
-        string sql = "SELECT name, hashcode FROM tbl_node WHERE id = " + id_str
+        string sql = "SELECT name FROM tbl_node WHERE id = " + id_str
             + " AND uid = " + std::to_string(user.id) + " AND status = 1";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(purge_callback, resp, directory, id_str, user.id, _1));
