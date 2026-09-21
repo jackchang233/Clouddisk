@@ -17,24 +17,36 @@
       >回收站</el-button>
     </el-aside>
 
-    <!-- 主区: 上传 + 文件列表 -->
+    <!-- 主区: 目录导航 + 文件列表 -->
     <el-main class="home-main">
       <div class="panel-card">
-        <h2 class="panel-title">
-          <span>文件列表</span>
-          <el-button :icon="Refresh" circle @click="loadFiles" />
-        </h2>
+        <!-- 工具栏 -->
+        <div class="toolbar">
+          <el-button type="primary" :icon="Upload" @click="pickFiles">上传</el-button>
+          <el-button :icon="FolderAdd" @click="onCreateDir">新建文件夹</el-button>
+          <el-button :icon="Refresh" circle @click="loadDir()" />
+        </div>
 
+        <!-- 面包屑: 由后端返回的 path 渲染。
+             前端不自己维护路径栈 —— 刷新页面/浏览器前进后退/直接跳转都会对不上 -->
+        <el-breadcrumb separator="/" class="breadcrumb">
+          <el-breadcrumb-item v-for="(n, i) in path" :key="n.id">
+            <a
+              class="crumb"
+              :class="{ 'crumb-current': i === path.length - 1 }"
+              @click="enterDir(n.id, i)"
+            >{{ n.name }}</a>
+          </el-breadcrumb-item>
+        </el-breadcrumb>
+
+        <!-- 上传控件隐藏在按钮后面 -->
         <el-upload
-          class="drop-zone"
-          drag
+          ref="uploadRef"
+          style="display: none"
           multiple
           :show-file-list="false"
           :http-request="doUpload"
-        >
-          <el-icon :size="42" color="#4f6ef7"><UploadFilled /></el-icon>
-          <div class="el-upload__text">拖拽文件到这里，或 <em>点击选择文件</em></div>
-        </el-upload>
+        />
 
         <el-progress
           v-if="uploading"
@@ -42,28 +54,38 @@
           :percentage="uploadPercent"
         />
 
-        <el-table :data="files" v-loading="loadingList" style="width: 100%">
-          <el-table-column label="文件名" min-width="220">
+        <el-table
+          :data="entries"
+          v-loading="loading"
+          style="width: 100%"
+          @row-dblclick="onRowDblClick"
+        >
+          <el-table-column label="文件名" min-width="300">
             <template #default="{ row }">
-              <el-icon style="vertical-align: -2px; margin-right: 6px"><Document /></el-icon>
-              {{ row.FileName }}
+              <el-icon class="entry-icon" :class="row.IsDir ? 'icon-dir' : 'icon-file'">
+                <Folder v-if="row.IsDir" /><Document v-else />
+              </el-icon>
+              {{ row.Name }}
             </template>
           </el-table-column>
           <el-table-column label="大小" width="110">
-            <template #default="{ row }">{{ fmtSize(row.FileSize) }}</template>
+            <template #default="{ row }">{{ row.IsDir ? '-' : fmtSize(row.Size) }}</template>
           </el-table-column>
-          <el-table-column prop="UploadAt" label="上传时间" width="180" />
-          <el-table-column prop="LastUpdated" label="更新时间" width="180" />
-          <el-table-column label="操作" width="140">
+          <el-table-column label="类型" width="110">
+            <template #default="{ row }">{{ row.IsDir ? '文件夹' : fileType(row.Name) }}</template>
+          </el-table-column>
+          <el-table-column prop="UpdatedAt" label="修改时间" width="180" />
+          <el-table-column label="操作" width="180">
             <template #default="{ row }">
-              <a class="download-link" :href="downloadUrl(row)">
+              <a v-if="!row.IsDir" class="download-link" :href="downloadUrl(row)">
                 <el-button type="primary" link :icon="Download">下载</el-button>
               </a>
+              <el-button link :icon="EditPen" @click="onRename(row)">重命名</el-button>
               <el-button type="danger" link :icon="Delete" @click="onDelete(row)">删除</el-button>
             </template>
           </el-table-column>
           <template #empty>
-            <el-empty description="还没有文件，上传一个试试" />
+            <el-empty description="这个文件夹是空的，拖拽文件到「上传」按钮试试" />
           </template>
         </el-table>
       </div>
@@ -100,65 +122,151 @@
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { UploadFilled, Document, Download, Refresh, SwitchButton, Delete, RefreshRight } from '@element-plus/icons-vue'
+import {
+  Upload, FolderAdd, Folder, Document, Download, Refresh, SwitchButton,
+  Delete, EditPen, RefreshRight
+} from '@element-plus/icons-vue'
 import api, { unwrap, formBody, errMsg } from '../api'
 
 const router = useRouter()
 const userInfo = reactive({ Username: '', SignupAt: '' })
-const files = ref([])
-const loadingList = ref(false)
+
+// 当前目录状态。path 由后端返回, 前端只渲染
+const currentDirId = ref(0)
+const path = ref([{ id: 0, name: '全部文件' }])
+const entries = ref([])
+const loading = ref(false)
+
 const uploading = ref(false)
 const uploadPercent = ref(0)
+const uploadRef = ref(null)
+
 const recycleVisible = ref(false)
 const recycleFiles = ref([])
 const loadingRecycle = ref(false)
 
+const CHUNK_SIZE = 5 * 1024 * 1024
+
 onMounted(() => {
   loadUserInfo()
-  loadFiles()
+  loadDir(0)
 })
 
-// 无效 token 现在统一回 401，由 api.js 的响应拦截器全局处理 (清 token + 回登录页)
 async function loadUserInfo() {
   try {
     const body = unwrap(await api.get('/user/info'))
     userInfo.Username = body.data.Username
     userInfo.SignupAt = body.data.SignupAt
   } catch (err) {
-    /* 401 已由拦截器统一处理，这里只需吞掉异常避免控制台报未捕获 */
+    /* 401 已由拦截器统一处理 */
   }
 }
 
-async function loadFiles() {
-  loadingList.value = true
+// 加载目录。dirId 省略则刷新当前目录
+async function loadDir(dirId) {
+  loading.value = true
   try {
-    const list = unwrap(await api.post('/file/query', formBody({ limit: 50 })))
-    files.value = Array.isArray(list) ? list : []
+    const body = unwrap(await api.post('/dir/list', formBody({
+      parent_id: dirId == null ? currentDirId.value : dirId
+    })))
+    currentDirId.value = dirId == null ? currentDirId.value : dirId
+    path.value = body.path || []
+    entries.value = body.entries || []
   } catch (err) {
-    ElMessage.error(errMsg(err, '文件列表加载失败'))
+    ElMessage.error(errMsg(err, '目录加载失败'))
   } finally {
-    loadingList.value = false
+    loading.value = false
   }
 }
 
-// 分片大小。超过这个尺寸走分片上传, 否则走原有的整文件上传。
-// 与后端约定一致即可, 后端从 init 参数里读。
-const CHUNK_SIZE = 5 * 1024 * 1024
+// 点面包屑: 跳到那一层, 丢弃它之后的部分
+function enterDir(id, index) {
+  if (index === path.value.length - 1) return   // 当前层, 无需重复加载
+  path.value = path.value.slice(0, index + 1)
+  loadDir(id)
+}
 
-// 采样指纹: 文件名 + 大小 + 首尾各 1MB 一起做 SHA-256。
-//
-// 为什么不读整个文件算哈希: 2GB 文件要读若干秒, 用户会以为页面卡死。
-// 为什么不用随机 UUID: 那样换浏览器/清缓存就丢了, 本质上不是"续传"。
-// 采样指纹只有 2MB 的读取量, 且**由内容决定** —— 同一文件在任何设备
-// 算出的值相同, 所以断点续传真正可用。
+// 双击: 目录进入, 文件下载。这是从资源管理器带过来的肌肉记忆
+function onRowDblClick(row) {
+  if (row.IsDir) loadDir(row.Id)
+  else download(row)
+}
+
+async function pickFiles() {
+  // el-upload 的隐藏 input 通过点击触发
+  uploadRef.value?.$el?.querySelector('input')?.click()
+}
+
+async function onCreateDir() {
+  let name
+  try {
+    ({ value: name } = await ElMessageBox.prompt('请输入文件夹名称', '新建文件夹', {
+      inputPattern: /^[^/\\:*?"<>|]{1,255}$/,
+      inputErrorMessage: '名称不能为空, 且不能包含 / \\ : * ? " < > |',
+      confirmButtonText: '创建',
+      cancelButtonText: '取消'
+    }))
+  } catch {
+    return   // 用户取消
+  }
+  try {
+    await api.post('/dir/create', formBody({ parent_id: currentDirId.value, name }))
+    ElMessage.success('创建成功')
+    loadDir()
+  } catch (err) {
+    ElMessage.error(errMsg(err, '创建失败'))
+  }
+}
+
+async function onRename(row) {
+  let name
+  try {
+    ({ value: name } = await ElMessageBox.prompt('请输入新名称', '重命名', {
+      inputValue: row.Name,
+      inputPattern: /^[^/\\:*?"<>|]{1,255}$/,
+      inputErrorMessage: '名称不能为空, 且不能包含 / \\ : * ? " < > |',
+      confirmButtonText: '确定',
+      cancelButtonText: '取消'
+    }))
+  } catch {
+    return
+  }
+  if (name === row.Name) return
+  try {
+    await api.post('/dir/rename', formBody({ id: row.Id, name }))
+    ElMessage.success('已重命名')
+    loadDir()
+  } catch (err) {
+    ElMessage.error(errMsg(err, '重命名失败'))
+  }
+}
+
+async function onDelete(row) {
+  const what = row.IsDir ? '文件夹及其全部内容' : '文件'
+  try {
+    await ElMessageBox.confirm(`确定删除${what}「${row.Name}」吗？`, '删除确认', {
+      type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消'
+    })
+  } catch {
+    return
+  }
+  try {
+    await api.post('/file/delete', formBody({ id: row.Id }))
+    ElMessage.success('已移入回收站')
+    loadDir()
+  } catch (err) {
+    ElMessage.error(errMsg(err, '删除失败'))
+  }
+}
+
+// ---------- 上传 ----------
+// 采样指纹: 文件名 + 大小 + 首尾各 1MB 的 SHA-256。
+// 只读 2MB, 大文件不会卡首屏; 标识由内容决定, 跨设备/刷新后仍能续传同一文件。
 async function fileFingerprint(file) {
   if (!window.crypto || !window.crypto.subtle) {
-    // crypto.subtle 只在安全上下文 (https 或 localhost) 可用。
-    // 非安全上下文下降级为随机标识: 仍能上传, 但刷新后无法续传。
     console.warn('crypto.subtle 不可用, 降级为随机上传标识 (无法跨会话续传)')
     return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
   }
-
   const SAMPLE = 1024 * 1024
   const head = await file.slice(0, SAMPLE).arrayBuffer()
   const tail = await file.slice(Math.max(0, file.size - SAMPLE)).arrayBuffer()
@@ -173,22 +281,16 @@ async function fileFingerprint(file) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-// 分片上传 + 断点续传
 async function doChunkedUpload(file) {
   const uploadId = await fileFingerprint(file)
 
-  // init: 建会话并询问后端"传到哪了"
-  const init = unwrap(
-    await api.post(
-      '/file/upload/init',
-      formBody({
-        upload_id: uploadId,
-        filename: file.name,
-        size: file.size,
-        chunk_size: CHUNK_SIZE
-      })
-    )
-  )
+  const init = unwrap(await api.post('/file/upload/init', formBody({
+    upload_id: uploadId,
+    filename: file.name,
+    size: file.size,
+    chunk_size: CHUNK_SIZE,
+    parent_id: currentDirId.value
+  })))
   const done = new Set(init.done || [])
   const total = Math.ceil(file.size / CHUNK_SIZE)
 
@@ -222,8 +324,8 @@ async function doUpload({ file }) {
       await doChunkedUpload(file)
     } else {
       const fd = new FormData()
+      fd.append('parent_id', currentDirId.value)
       fd.append('file', file)
-      // 不手动设 Content-Type，让 axios/浏览器自动带上 multipart boundary
       await api.post('/file/upload', fd, {
         onUploadProgress: (e) => {
           if (e.total) uploadPercent.value = Math.round((e.loaded / e.total) * 100)
@@ -231,7 +333,7 @@ async function doUpload({ file }) {
       })
     }
     ElMessage.success(`${file.name} 上传成功`)
-    loadFiles()
+    loadDir()
   } catch (err) {
     ElMessage.error(errMsg(err, `${file.name} 上传失败`))
   } finally {
@@ -240,36 +342,22 @@ async function doUpload({ file }) {
   }
 }
 
-// 下载不走 AJAX: 带 query 的普通链接，浏览器按 Content-Disposition 落盘
+// 下载不走 AJAX: 带 query 的普通链接, 浏览器按 Content-Disposition 落盘
 function downloadUrl(row) {
   const p = new URLSearchParams({
-    filename: row.FileName,
-    filehash: row.FileHash,
+    filename: row.Name,
+    filehash: row.FileHash || '',
     username: localStorage.getItem('username') || '',
     token: localStorage.getItem('token') || ''
   })
   return '/file/download?' + p.toString()
 }
 
-async function onDelete(row) {
-  try {
-    await ElMessageBox.confirm(`确定删除「${row.FileName}」吗？`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消'
-    })
-  } catch (_) {
-    return  // 用户取消
-  }
-  try {
-    await api.post('/file/delete', formBody({ id: row.Id }))
-    ElMessage.success('删除成功')
-    loadFiles()
-  } catch (err) {
-    ElMessage.error(errMsg(err, '删除失败'))
-  }
+function download(row) {
+  window.location.href = downloadUrl(row)
 }
 
+// ---------- 回收站 ----------
 async function openRecycle() {
   recycleVisible.value = true
   await loadRecycle()
@@ -292,7 +380,7 @@ async function onRestore(row) {
     await api.post('/file/restore', formBody({ id: row.Id }))
     ElMessage.success(`已恢复「${row.FileName}」`)
     loadRecycle()
-    loadFiles()
+    loadDir()
   } catch (err) {
     ElMessage.error(errMsg(err, '恢复失败'))
   }
@@ -300,12 +388,11 @@ async function onRestore(row) {
 
 async function onPurge(row) {
   try {
-    await ElMessageBox.confirm(`彻底删除「${row.FileName}」后将无法恢复，确定吗？`, '彻底删除确认', {
-      type: 'warning',
-      confirmButtonText: '彻底删除',
-      cancelButtonText: '取消'
-    })
-  } catch (_) {
+    await ElMessageBox.confirm(
+      `彻底删除「${row.FileName}」后将无法恢复，确定吗？`, '彻底删除确认',
+      { type: 'warning', confirmButtonText: '彻底删除', cancelButtonText: '取消' }
+    )
+  } catch {
     return
   }
   try {
@@ -317,6 +404,7 @@ async function onPurge(row) {
   }
 }
 
+// ---------- 工具 ----------
 function fmtSize(n) {
   if (n == null) return '--'
   if (n < 1024) return n + ' B'
@@ -325,9 +413,49 @@ function fmtSize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB'
 }
 
+function fileType(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase()
+  if (!ext || ext === name.toLowerCase()) return '文件'
+  return ext.toUpperCase()
+}
+
 function onLogout() {
   localStorage.removeItem('token')
   localStorage.removeItem('username')
   router.push('/login')
 }
 </script>
+
+<style scoped>
+.toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.breadcrumb {
+  margin-bottom: 16px;
+  font-size: 14px;
+}
+.crumb {
+  cursor: pointer;
+  color: #4f6ef7;
+}
+.crumb:hover { text-decoration: underline; }
+/* 当前层不可点, 视觉上也弱化掉可点的暗示 */
+.crumb-current {
+  color: #303133;
+  cursor: default;
+  font-weight: 600;
+}
+.crumb-current:hover { text-decoration: none; }
+
+.entry-icon {
+  vertical-align: -2px;
+  margin-right: 6px;
+}
+.icon-dir { color: #ffb800; }
+.icon-file { color: #909399; }
+
+.upload-progress { margin-bottom: 14px; }
+</style>
