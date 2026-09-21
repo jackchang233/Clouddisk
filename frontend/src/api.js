@@ -3,16 +3,20 @@ import { ElMessage } from 'element-plus'
 
 const api = axios.create({ timeout: 30000 })
 
-// 与后端约定: username/token 走 URL query (原 auth.js 的 queryParams 方案)
-// 拦截器统一注入，业务代码不用每次手动拼
+// 与后端约定: username/token 走 URL query
+//
+// 这里**不判断路径前缀**, 一律注入。原先写的是
+//   if (url.startsWith('/user') || url.startsWith('/file'))
+// 结果加 /dir 路由时忘了同步, /dir/list 拿不到 token -> 401 ->
+// 响应拦截器清 token 并提示"登录已过期" —— 刚登录就被登出, 且现象
+// 指向"token 失效"而不是"某个路由漏配", 排查方向完全被带偏。
+//
+// 对自有后端发 token 没有副作用, 所以去掉这个必须手工维护的列表。
 api.interceptors.request.use((config) => {
-  const url = config.url || ''
-  if (url.startsWith('/user') || url.startsWith('/file')) {
-    config.params = {
-      username: localStorage.getItem('username') || '',
-      token: localStorage.getItem('token') || '',
-      ...config.params
-    }
+  config.params = {
+    username: localStorage.getItem('username') || '',
+    token: localStorage.getItem('token') || '',
+    ...config.params
   }
   return config
 })
