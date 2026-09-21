@@ -133,6 +133,35 @@ static int parse_parent_id(const string& s)
     catch (const std::exception&) { return -1; }
 }
 
+// 递归创建目录。
+// 所以这里统一用递归版本, 以后路径再加层级也不会出问题。
+static bool ensure_dir(const string& path)
+{
+    if (path.empty()) return false;
+    string cur;
+    size_t start = 0;
+    while (start < path.size()) {
+        size_t slash = path.find('/', start);
+        if (slash == string::npos) slash = path.size();
+        cur = path.substr(0, slash);
+        if (!cur.empty() && access(cur.c_str(), F_OK) != 0) {
+            if (mkdir(cur.c_str(), 0777) != 0 && errno != EEXIST)
+                return false;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
+
+// 目录名合法性: 非空、不含路径分隔符与常见非法字符。
+// 前端也会校验, 但那只是体验优化 —— 后端必须独立校验。
+static bool valid_entry_name(const string& s)
+{
+    if (s.empty() || s.size() > 255) return false;
+    if (s == "." || s == "..") return false;
+    return s.find_first_of("/\\:*?\"<>|") == string::npos;
+}
+
 
 // 清理「引用计数归零且已无人引用」的内容池行。
 //
@@ -144,12 +173,38 @@ static int parse_parent_id(const string& s)
 // (不能用多语句, workflow 的 MySQL 走文本协议, 未开 CLIENT_MULTI_STATEMENTS)
 static void sweep_unreferenced_blobs()
 {
-    WFMySQLTask* task = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
-        [](WFMySQLTask*) {});
-    task->get_req()->set_query(
-        "DELETE b FROM tbl_blob b LEFT JOIN tbl_node n ON n.hashcode = b.hashcode "
-        "WHERE b.refcnt <= 0 AND n.id IS NULL");
-    Workflow::create_series_work(task, nullptr)->start();
+    // 先查出「引用计数归零且已无人引用」的内容 —— 这些要连物理文件一起回收。
+    // 两阶段(先查后删)而不是一条 DELETE: 物理文件必须先知道 hashcode 才能删。
+    const char* cond =
+        "b.refcnt <= 0 AND NOT EXISTS "
+        "(SELECT 1 FROM tbl_node n WHERE n.hashcode = b.hashcode)";
+
+    WFMySQLTask* q = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
+        [cond](WFMySQLTask* task)
+        {
+            MySQLResultCursor cursor(task->get_resp());
+            if (cursor.get_cursor_status() != MYSQL_STATUS_GET_RESULT) return;
+
+            vector<MySQLCell> row;
+            bool any = false;
+            while (cursor.fetch_row(row)) {
+                any = true;
+                string p = "files/blobs/" + row[0].as_string();
+                if (unlink(p.c_str()) != 0 && errno != ENOENT)
+                    std::cout << "[WARN] 内容池物理文件删除失败: " << p << std::endl;
+            }
+            if (!any) return;
+
+            WFMySQLTask* del = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
+                [](WFMySQLTask*) {});
+            del->get_req()->set_query(
+                std::string("DELETE b FROM tbl_blob b WHERE ") + cond);
+            Workflow::create_series_work(del, nullptr)->start();
+        });
+
+    q->get_req()->set_query(
+        std::string("SELECT b.hashcode FROM tbl_blob b WHERE ") + cond);
+    Workflow::create_series_work(q, nullptr)->start();
 }
 
 /*********************************************************************************
@@ -477,22 +532,31 @@ void CloudiskServer::register_fileupload_module()
             // 它们不是文件, 跳过 —— 否则会被当文件写到磁盘上
             if (filename.empty()) continue;
             string hashcode = CryptoUtil::generate_hashcode(content.c_str(),content.size());
-            string directory = "files/" + username +"/";
-            if(access(directory.c_str(),F_OK)){
-                mkdir(directory.c_str(),0777);
-            }
-            string filepath = directory + PathUtil::base(filename);
-#ifdef DEBUG
-            cout << "filepath: " << filepath << endl;
-#endif
-            int fd = open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            if (fd < 0) {
+
+            // 物理存储改为**内容寻址**: files/blobs/<hashcode>
+            // 与虚拟路径解耦 —— 重命名/移动只改数据库, 不碰文件系统;
+            // 也顺带得到存储层去重: 同一内容只存一份, 多个节点指向它。
+            if (!ensure_dir("files/blobs")) {
                 ErrorUtil::send_error(resp, 500);
                 return ;
             }
-            // 写入文件
-            write(fd, content.c_str(), content.size());
-            close(fd);
+            string filepath = "files/blobs/" + hashcode;
+
+            // 内容已在池中则跳过写入 —— 这就是"秒传"的存储侧实现,
+            // 也是不同用户上传同一文件只占一份空间的原因
+            if (access(filepath.c_str(), F_OK) != 0) {
+                int fd = open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    ErrorUtil::send_error(resp, 500);
+                    return ;
+                }
+                ssize_t wrote = write(fd, content.c_str(), content.size());
+                close(fd);
+                if (wrote != (ssize_t)content.size()) {
+                    ErrorUtil::send_error(resp, 500);
+                    return ;
+                }
+            }
 
             // [OSS备份]: 异步备份，往消息队列中写入一条消息
             // 消息体对齐消费者的 OSSManager::upload_file(bucket, object, file)
@@ -639,7 +703,7 @@ void CloudiskServer::register_filelist_module()
  *                               下载文件                                        *
  *********************************************************************************/
 // 下载回调: 查库确认文件存在且未被软删后才真正下发文件
-void download_callback(HttpResp* resp, string filepath, string filename, MySQLResultCursor* cursor)
+void download_callback(HttpResp* resp, string blobs_dir, MySQLResultCursor* cursor)
 {
     if (cursor->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
         ErrorUtil::send_error(resp, 500);
@@ -651,6 +715,11 @@ void download_callback(HttpResp* resp, string filepath, string filename, MySQLRe
         ErrorUtil::send_error(resp, 404, "文件不存在或已删除");
         return;
     }
+    // 物理存储是内容寻址的: files/blobs/<hashcode> —— 与虚拟路径无关,
+    // 所以重命名/移动不需要动文件系统。
+    // 文件名从库里取 (record[0]), 不信任客户端传的。
+    string filename = record[0].as_string();
+    string filepath = blobs_dir + record[1].as_string();
     // 双写兼容: filename* (RFC 5987) 是现代浏览器优先读取的标准写法，
     // filename 作为旧客户端回退。两者都必须是纯 ASCII
     string fname = percent_encode(PathUtil::base(filename));
@@ -684,17 +753,21 @@ void CloudiskServer::register_filedownload_module()
             return ;
         }
 
-        string filepath = "files/" + user.username + "/" + PathUtil::base(filename);
-#ifdef DEBUG
-        cout << "filepath: " << filepath << endl;
-#endif
-        // 下载前查库: 确认该文件属于当前用户且未被软删 (status=0)，否则 404
-        // 注意: escape_string_quote 只转义不加引号，外层单引号需自己补
-        string sql = "SELECT name FROM tbl_node WHERE uid = " + std::to_string(user.id)
-            + " AND name = '" + MySQLUtil::escape_string_quote(filename, '\'') + "'"
-            + " AND is_dir = 0 AND status = 0";
+        // 按**节点 id** 定位, 而不是文件名 —— 有了目录后不同目录下可以有同名文件,
+        // 只靠 name 查询会产生歧义 (可能下错一个)。
+        string id_str = req->query("id");
+        if (id_str.empty() || id_str.find_first_not_of("0123456789") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的文件ID");
+            return ;
+        }
 
-        resp->MySQL(MYSQL_URL, sql, std::bind(download_callback, resp, filepath, filename, _1));
+        // 查库: 确认属于当前用户 + 未软删 + 是文件。
+        //   hashcode -> 定位内容池里的物理文件
+        //   name     -> 设置 Content-Disposition (客户端用它命名落盘文件)
+        string sql = "SELECT name, hashcode FROM tbl_node WHERE id = " + id_str
+            + " AND uid = " + std::to_string(user.id) + " AND is_dir = 0 AND status = 0";
+
+        resp->MySQL(MYSQL_URL, sql, std::bind(download_callback, resp, "files/blobs/", _1));
     });
 }
 
@@ -866,20 +939,19 @@ void purge_callback(HttpResp* resp, string directory, string id_str, int uid, My
         "   WHERE n.uid = " + std::to_string(uid)
         + ") SELECT id FROM subtree)";
 
-    // ① 取出子树里的所有文件: 用于删物理文件
-    string sel_files = "SELECT name FROM tbl_node WHERE id IN " + subtree + " AND is_dir = 0";
+    // 注意: 物理文件**不在这里删**。内容池里的文件可能被多个节点共享,
+    // 只有引用计数归零才该回收 —— 那一步统一交给 sweep_unreferenced_blobs()。
+    // 所以这里只收集 hashcode 供递减计数用, 不需要节点名。
+    string sel_files = "SELECT id FROM tbl_node WHERE id IN " + subtree + " AND is_dir = 0 LIMIT 1";
 
     resp->MySQL(MYSQL_URL, sel_files,
-        [resp, directory, id_str, uid, subtree](MySQLResultCursor* c0)
+        [resp, id_str, uid, subtree](MySQLResultCursor* c0)
     {
         if (c0->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
             ErrorUtil::send_error(resp, 500);
             return ;
         }
-        vector<string> paths;
-        vector<MySQLCell> r;
-        while (c0->fetch_row(r))
-            paths.push_back(directory + PathUtil::base(r[0].as_string()));
+        vector<string> paths;      // 保留变量以最小化改动, 不再承载路径
 
         // ② 按子树内每个 hashcode 的出现次数批量递减引用计数
         string unref =
@@ -906,11 +978,8 @@ void purge_callback(HttpResp* resp, string directory, string id_str, int uid, My
                     ErrorUtil::send_error(resp, 500);
                     return ;
                 }
-                // ④ 删物理文件 (尽力而为; 失败留孤儿文件, 无害)
-                for (const string& p : paths) {
-                    if (unlink(p.c_str()) != 0)
-                        std::cout << "[WARN] 物理文件删除失败: " << p << std::endl;
-                }
+                // ④ 回收「引用计数归零」的内容: 既删池行, 也删物理文件。
+                //    不在这里直接 unlink 节点路径 —— 同内容可能被别的节点共享。
                 sweep_unreferenced_blobs();
                 resp->String(R"({"code":0,"msg":"SUCCESS"})");
             });
@@ -1130,25 +1199,6 @@ static string chunk_dir(int uid, const string& upload_id)
     return "tmp/" + std::to_string(uid) + "/" + upload_id + "/";
 }
 
-// 递归创建目录。
-// 所以这里统一用递归版本, 以后路径再加层级也不会出问题。
-static bool ensure_dir(const string& path)
-{
-    if (path.empty()) return false;
-    string cur;
-    size_t start = 0;
-    while (start < path.size()) {
-        size_t slash = path.find('/', start);
-        if (slash == string::npos) slash = path.size();
-        cur = path.substr(0, slash);
-        if (!cur.empty() && access(cur.c_str(), F_OK) != 0) {
-            if (mkdir(cur.c_str(), 0777) != 0 && errno != EEXIST)
-                return false;
-        }
-        start = slash + 1;
-    }
-    return true;
-}
 
 // 把「已传分片下标」查出来返回给前端 —— 这是断点续传的关键:
 // 前端拿到后跳过这些下标, 剩下的照传。
@@ -1178,6 +1228,129 @@ static void reply_done_chunks(HttpResp* resp, int uid, const string& upload_id)
 
 void CloudiskServer::register_chunkupload_module()
 {
+    // ============ check: 秒传判定 ============
+    //
+    // 客户端先算出文件的完整 SHA-256, 问服务端"这个内容你有没有"。
+    // 有的话直接建节点, 一个字节都不用传。
+    //
+    // ⚠️ 安全: 只查**当前用户自己**的节点, 不查全局内容池。
+    //    否则攻击者拿到某个文件的 hash 就能"秒传"别人的文件 ——
+    //    即使他根本没有那个文件的内容。
+    //    注意这与"存储层去重"不冲突: 存储仍然是全局共享的,
+    //    只是秒传的判定范围限制在用户自己的文件里。
+    m_server.POST("/file/upload/check", [](const HttpReq* req, HttpResp* resp)
+    {
+        string token = req->query("token");
+        User user;
+        if (!CryptoUtil::verify_token(token, user)) {
+            ErrorUtil::send_error(resp, 401);
+            return ;
+        }
+
+        map<string, string>& data = req->form_kv();
+        string hashcode = form_get(data, "hashcode");
+        string filename = form_get(data, "filename");
+        string pid_str  = form_get(data, "parent_id");
+
+        // hashcode 是十六进制, 严格白名单 (会被拼进 SQL 与磁盘路径)
+        if (hashcode.size() != 64 ||
+            hashcode.find_first_not_of("0123456789abcdef") != string::npos) {
+            ErrorUtil::send_error(resp, 400, "无效的文件哈希");
+            return ;
+        }
+        if (!valid_entry_name(filename)) {
+            ErrorUtil::send_error(resp, 400, "文件名不合法");
+            return ;
+        }
+        if (parse_parent_id(pid_str) < 0) {
+            ErrorUtil::send_error(resp, 400, "无效的目录ID");
+            return ;
+        }
+        if (pid_str.empty()) pid_str = "0";
+
+        with_valid_parent(resp, user.id, pid_str,
+            [resp, user, hashcode, filename, pid_str]()
+        {
+            // 只查自己的节点 —— 见上面的安全说明
+            string sel = "SELECT 1 FROM tbl_node WHERE uid = " + std::to_string(user.id)
+                + " AND hashcode = " + sql_quote(hashcode)
+                + " AND is_dir = 0 LIMIT 1";
+
+            resp->MySQL(MYSQL_URL, sel,
+                [resp, user, hashcode, filename, pid_str](MySQLResultCursor* c0)
+            {
+                if (c0->get_cursor_status() != MYSQL_STATUS_GET_RESULT) {
+                    ErrorUtil::send_error(resp, 500);
+                    return ;
+                }
+                vector<MySQLCell> row;
+                if (!c0->fetch_row(row)) {
+                    // 自己没传过 -> 走正常上传流程
+                    resp->String(R"({"instant":false})");
+                    return ;
+                }
+
+                // 命中: 建节点即可, 一个字节都不用传。
+                // 三步与上传一致 (先 unref 被覆盖的旧内容 -> 递增 -> 写节点),
+                // 只是省掉了写物理文件那一段。
+                string size_sql = "SELECT size FROM tbl_blob WHERE hashcode = " + sql_quote(hashcode);
+
+                resp->MySQL(MYSQL_URL, size_sql,
+                    [resp, user, hashcode, filename, pid_str](MySQLResultCursor* c1)
+                {
+                    long long size = 0;
+                    vector<MySQLCell> r;
+                    if (c1->get_cursor_status() == MYSQL_STATUS_GET_RESULT && c1->fetch_row(r))
+                        size = r[0].as_ulonglong();
+                    string size_s = std::to_string(size);
+
+                    string unref =
+                        "UPDATE tbl_blob b JOIN tbl_node n ON n.hashcode = b.hashcode "
+                        "SET b.refcnt = b.refcnt - 1 "
+                        "WHERE n.uid = " + std::to_string(user.id)
+                        + " AND n.parent_id = " + pid_str + " AND n.is_dir = 0"
+                        + " AND n.name = " + sql_quote(filename)
+                        + " AND n.hashcode <> " + sql_quote(hashcode);
+
+                    resp->MySQL(MYSQL_URL, unref,
+                        [resp, user, hashcode, filename, pid_str, size_s](MySQLResultCursor* c2)
+                    {
+                        if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
+                            ErrorUtil::send_error(resp, 500);
+                            return ;
+                        }
+                        string inc = "UPDATE tbl_blob SET refcnt = refcnt + 1 WHERE hashcode = "
+                            + sql_quote(hashcode);
+                        resp->MySQL(MYSQL_URL, inc,
+                            [resp, user, hashcode, filename, pid_str, size_s](MySQLResultCursor* c3)
+                        {
+                            if (c3->get_cursor_status() != MYSQL_STATUS_OK) {
+                                ErrorUtil::send_error(resp, 500);
+                                return ;
+                            }
+                            string node = "INSERT INTO tbl_node "
+                                "(uid, parent_id, name, is_dir, hashcode, size) VALUES ("
+                                + std::to_string(user.id) + ", " + pid_str + ", "
+                                + sql_quote(filename) + ", 0, " + sql_quote(hashcode) + ", "
+                                + size_s + ") "
+                                "ON DUPLICATE KEY UPDATE hashcode = VALUES(hashcode), "
+                                "size = VALUES(size), status = 0, deleted_at = NULL";
+                            resp->MySQL(MYSQL_URL, node, [resp](MySQLResultCursor* c4)
+                            {
+                                if (c4->get_cursor_status() != MYSQL_STATUS_OK) {
+                                    ErrorUtil::send_error(resp, 500);
+                                    return ;
+                                }
+                                sweep_unreferenced_blobs();
+                                resp->String(R"({"instant":true})");
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+
     // ============ init: 建会话 + 返回已传分片 ============
     m_server.POST("/file/upload/init", [](const HttpReq* req, HttpResp* resp)
     {
@@ -1417,12 +1590,15 @@ void CloudiskServer::register_chunkupload_module()
             string pid_str    = std::to_string(row[3].as_int());
 
             string dir = chunk_dir(user.id, upload_id);
-            string directory = "files/" + user.username + "/";
-            if (access(directory.c_str(), F_OK) != 0 && mkdir(directory.c_str(), 0777) != 0) {
+
+            // 合并目标先写**临时文件** —— 内容寻址的路径是 files/blobs/<hashcode>,
+            // 而 hashcode 要边写边算、写完才知道, 所以没法直接定位到目标。
+            // 写完再 rename 到内容池 (同一文件系统内的 rename 是原子的)。
+            if (!ensure_dir("files/blobs")) {
                 ErrorUtil::send_error(resp, 500);
                 return ;
             }
-            string filepath = directory + PathUtil::base(filename);
+            string tmpfile = "files/blobs/.tmp-" + upload_id;
 
             // ---- 合并: 顺序读分片追加写最终文件, 同时增量算 hash ----
             // 内存恒定 64KB, 与文件大小无关 —— 这是「分片」真正换来的东西。
@@ -1430,7 +1606,7 @@ void CloudiskServer::register_chunkupload_module()
             EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
             EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL);
 
-            int out = open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            int out = open(tmpfile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (out < 0) {
                 EVP_MD_CTX_free(mdctx);
                 ErrorUtil::send_error(resp, 500);
@@ -1457,7 +1633,7 @@ void CloudiskServer::register_chunkupload_module()
 
             if (!ok) {
                 EVP_MD_CTX_free(mdctx);
-                unlink(filepath.c_str());               // 清掉半成品
+                unlink(tmpfile.c_str());                // 清掉半成品
                 ErrorUtil::send_error(resp, 400, "分片不完整，请先传完所有分片");
                 return ;
             }
@@ -1471,10 +1647,21 @@ void CloudiskServer::register_chunkupload_module()
             for (unsigned i = 0; i < hash_len; i++)
                 sprintf(hex + 2 * i, "%02x", hash[i]);
             string hashcode(hex);
+            string filepath = "files/blobs/" + hashcode;
 
             if (merged != total) {
-                unlink(filepath.c_str());
+                unlink(tmpfile.c_str());
                 ErrorUtil::send_error(resp, 400, "文件大小与声明不符");
+                return ;
+            }
+
+            // 合并完成 -> 移入内容池。
+            // 若同内容已存在, 直接丢弃刚合并的临时文件 (存储层去重)。
+            if (access(filepath.c_str(), F_OK) == 0) {
+                unlink(tmpfile.c_str());
+            } else if (rename(tmpfile.c_str(), filepath.c_str()) != 0) {
+                unlink(tmpfile.c_str());
+                ErrorUtil::send_error(resp, 500);
                 return ;
             }
 
@@ -1620,14 +1807,6 @@ void CloudiskServer::start_chunk_sweep()
 static const int ROOT_DIR_ID = 0;
 static const char* const ROOT_DIR_NAME = "全部文件";
 
-// 目录名合法性: 非空、不含路径分隔符与常见非法字符。
-// 前端也会校验, 但那只是体验优化 —— 后端必须独立校验。
-static bool valid_entry_name(const string& s)
-{
-    if (s.empty() || s.size() > 255) return false;
-    if (s == "." || s == "..") return false;
-    return s.find_first_of("/\\:*?\"<>|") == string::npos;
-}
 
 // 列目录回调: 先拿到 entries, 再拼面包屑 path
 static void dirlists_callback(HttpResp* resp, int uid, int parent_id, MySQLResultCursor* cursor)

@@ -281,6 +281,43 @@ async function fileFingerprint(file) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+// 秒传阈值。超过它就不再尝试秒传, 直接走正常上传。
+//
+// ⚠️ 原因: Web Crypto 的 `crypto.subtle.digest` **不支持增量哈希** ——
+// 要算完整 SHA-256 就必须把整个文件读进内存。50MB 以上时, 读取 + 哈希的
+// 耗时和内存占用会超过"直接上传"的代价, 反而更慢。
+// 真正的网盘客户端用增量哈希库 (或 WASM) 解决这个问题, 本项目不引入额外依赖。
+const INSTANT_MAX = 50 * 1024 * 1024
+
+// 计算完整 SHA-256, 用于秒传判定。只对小文件调用 (见 INSTANT_MAX)
+async function fullHash(file) {
+  const buf = await file.arrayBuffer()
+  const digest = await crypto.subtle.digest('SHA-256', buf)
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 秒传: 先问服务端"这个内容你有没有"。
+// 命中则一个字节都不用传, 直接建好节点。
+// 服务端只查**当前用户自己**的文件 —— 所以拿到别人的 hash 也没用。
+async function tryInstantUpload(file) {
+  if (file.size > INSTANT_MAX) return false
+  if (!window.crypto || !window.crypto.subtle) return false
+
+  let hashcode
+  try {
+    hashcode = await fullHash(file)
+  } catch {
+    return false   // 哈希失败就退回正常上传
+  }
+
+  const r = unwrap(await api.post('/file/upload/check', formBody({
+    hashcode,
+    filename: file.name,
+    parent_id: currentDirId.value
+  })))
+  return r.instant === true
+}
+
 async function doChunkedUpload(file) {
   const uploadId = await fileFingerprint(file)
 
@@ -320,6 +357,12 @@ async function doUpload({ file }) {
   uploading.value = true
   uploadPercent.value = 0
   try {
+    // 先试秒传 —— 命中则一个字节都不用传
+    if (await tryInstantUpload(file)) {
+      ElMessage.success(`${file.name} 秒传成功`)
+      loadDir()
+      return
+    }
     if (file.size > CHUNK_SIZE) {
       await doChunkedUpload(file)
     } else {
@@ -342,12 +385,12 @@ async function doUpload({ file }) {
   }
 }
 
-// 下载不走 AJAX: 带 query 的普通链接, 浏览器按 Content-Disposition 落盘
+// 下载不走 AJAX: 带 query 的普通链接, 浏览器按 Content-Disposition 落盘。
+// 用**节点 id** 定位而不是文件名 —— 有了目录之后不同目录下可以有同名文件,
+// 只传文件名会给后端造成歧义。
 function downloadUrl(row) {
   const p = new URLSearchParams({
-    filename: row.Name,
-    filehash: row.FileHash || '',
-    username: localStorage.getItem('username') || '',
+    id: row.Id,
     token: localStorage.getItem('token') || ''
   })
   return '/file/download?' + p.toString()
