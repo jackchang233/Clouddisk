@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <cerrno>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1798,6 +1799,76 @@ static void chunk_sweep_timer_callback(WFTimerTask*)
 void CloudiskServer::start_chunk_sweep()
 {
     WFTaskFactory::create_timer_task(CHUNK_SWEEP_INTERVAL, 0, chunk_sweep_timer_callback)->start();
+}
+
+/*********************************************************************************
+ *                     内容池孤儿文件回收 (GC 兜底)                               *
+ *********************************************************************************/
+// sweep_unreferenced_blobs() 只覆盖「经由 API 删除」这条路径。物理文件还可能
+// 在 API 之外变成孤儿: 程序崩溃在"写完文件、还没写库"之间、手工改库、
+// 或异常导致的半途状态。这里的 GC 是兜底 —— 定期对账磁盘与内容池。
+//
+// 路径本身是内容寻址的 (文件名就是 hashcode), 所以对账很直接:
+// 扫目录, 逐个查内容池里有没有。
+//
+// ⚠️ 宽限期: 上传是「先写文件、后写库」, 两者之间有时间窗。若不设宽限期,
+//    GC 可能删掉一个刚写好、库行还没落的内容。取 1 小时, 远大于任何正常写入延迟。
+static const time_t BLOB_GC_GRACE = 3600;
+
+static void blob_gc()
+{
+    const string dir = "files/blobs";
+    DIR* dp = opendir(dir.c_str());
+    if (dp == nullptr) return;
+
+    vector<string> orphans;
+    time_t now = time(nullptr);
+    struct dirent* ent;
+    while ((ent = readdir(dp)) != nullptr) {
+        string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        if (!valid_upload_id(name)) continue;      // 非 64 位十六进制(如 .tmp-xxx)跳过
+        string full = dir + "/" + name;
+
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0) continue;
+        if (now - st.st_mtime < BLOB_GC_GRACE) continue;   // 宽限期内, 可能是正在写的
+
+        orphans.push_back(name);
+    }
+    closedir(dp);
+    if (orphans.empty()) return;
+
+    // 逐个查内容池 (数量很少, 不值得为它做批量查询)
+    for (const string& h : orphans) {
+        string sql = "SELECT 1 FROM tbl_blob WHERE hashcode = " + sql_quote(h) + " LIMIT 1";
+        WFMySQLTask* task = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
+            [h](WFMySQLTask* t)
+            {
+                MySQLResultCursor cursor(t->get_resp());
+                if (cursor.get_cursor_status() != MYSQL_STATUS_GET_RESULT) return;
+                vector<MySQLCell> row;
+                if (cursor.fetch_row(row)) return;     // 池中有 -> 不是孤儿
+
+                string p = "files/blobs/" + h;
+                if (unlink(p.c_str()) == 0)
+                    cout << "[INFO] 回收孤儿内容文件: " << h.substr(0, 16) << "..." << endl;
+            });
+        task->get_req()->set_query(sql);
+        Workflow::create_series_work(task, nullptr)->start();
+    }
+}
+
+static void blob_gc_timer_callback(WFTimerTask*)
+{
+    blob_gc();
+    WFTaskFactory::create_timer_task(CHUNK_SWEEP_INTERVAL, 0, blob_gc_timer_callback)->start();
+}
+
+void CloudiskServer::start_blob_gc()
+{
+    blob_gc();   // 启动时先跑一次 —— 上次异常退出留下的孤儿能被立即清理
+    WFTaskFactory::create_timer_task(CHUNK_SWEEP_INTERVAL, 0, blob_gc_timer_callback)->start();
 }
 
 /*********************************************************************************

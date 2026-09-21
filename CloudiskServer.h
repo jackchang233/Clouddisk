@@ -20,6 +20,9 @@ public:
     // 启动分片暂存区清理 (回收超期未完成的上传会话)
     void start_chunk_sweep();
 
+    // 启动内容池孤儿文件回收 (GC 兜底)
+    void start_blob_gc();
+
     int start(unsigned short port) { return m_server.start(port); }
 
     void stop() { m_server.stop(); }
