@@ -91,6 +91,24 @@ static string form_get(const map<string, string>& kv, const string& key)
     return it == kv.end() ? string() : CodeUtil::url_decode(it->second);
 }
 
+// 清理「引用计数归零且已无人引用」的内容池行。
+//
+// 为什么需要它: 覆盖上传时旧内容的 refcnt 减到 0, 但递减语句本身不会删行;
+// 而把「递减 + 删行」塞进上传/删除的回调链, 会让本已很深的嵌套再深一层。
+// 这里做成 fire-and-forget —— 它不影响响应结果, 失败了下次还会再扫。
+//
+// 单条语句即可: LEFT JOIN 后 n.id IS NULL 表示没有任何节点引用它。
+// (不能用多语句, workflow 的 MySQL 走文本协议, 未开 CLIENT_MULTI_STATEMENTS)
+static void sweep_unreferenced_blobs()
+{
+    WFMySQLTask* task = WFTaskFactory::create_mysql_task(MYSQL_URL, 1,
+        [](WFMySQLTask*) {});
+    task->get_req()->set_query(
+        "DELETE b FROM tbl_blob b LEFT JOIN tbl_node n ON n.hashcode = b.hashcode "
+        "WHERE b.refcnt <= 0 AND n.id IS NULL");
+    Workflow::create_series_work(task, nullptr)->start();
+}
+
 /*********************************************************************************
  *                     服务发现: 后台刷新 UserService 实例表                      *
  *********************************************************************************/
@@ -305,7 +323,6 @@ void CloudiskServer::register_signin_module()
         // 区别只在 task 归谁:
         //   client.sign_in(req, done) 内部是 task->start()  —— task 自成一个 series,
         //     handler 返回后请求 series 就空了、响应立刻发出, 回调再写 resp 已经晚了
-        //     (实测: 返回 HTTP 200 但响应体为空)
         //   series->push_back(task)    —— task 属于请求的 series, series 不结束就不发响应,
         //     回调里写 resp 是安全的
         srpc::SRPCClientTask* task = client->create_sign_in_task(
@@ -436,22 +453,56 @@ void CloudiskServer::register_fileupload_module()
             string exchange = "ossbackup";
             string routingKey = "oss";
             channel->BasicPublish(exchange, routingKey, message);
-            // 写`tbl_file`表
-            string sql = "REPLACE INTO tbl_file (uid, filename, hashcode, size) VALUES ("
-                + std::to_string(user.id) + ", "
-                + sql_quote(filename) + ", "
-                + sql_quote(hashcode) + ", "
-                + std::to_string(content.size()) + ")";
+            // 落库分三步, 顺序不能颠倒:
+            //   ① 递减「被覆盖掉的旧内容」的引用 (同名但内容不同时)
+            //   ② 递增/插入新内容的引用
+            //   ③ 写节点
+            // 用 REPLACE INTO 会先删后插(重置 created_at), 且无法维护引用计数,
+            // 所以改成显式的三步。
+            string size_s = std::to_string(content.size());
 
-            std::cout << "[SQL] " << sql << endl;
+            string unref_old = "UPDATE tbl_blob b JOIN tbl_node n ON n.hashcode = b.hashcode "
+                "SET b.refcnt = b.refcnt - 1 "
+                "WHERE n.uid = " + std::to_string(user.id)
+                + " AND n.parent_id = 0 AND n.is_dir = 0 AND n.name = " + sql_quote(filename)
+                + " AND n.hashcode <> " + sql_quote(hashcode);
 
-            resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
+            resp->MySQL(MYSQL_URL, unref_old,
+                [resp, user, filename, hashcode, size_s](MySQLResultCursor* c1)
             {
-                if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
+                if (c1->get_cursor_status() != MYSQL_STATUS_OK) {
                     ErrorUtil::send_error(resp, 500);
                     return ;
                 }
-                resp->String(R"({"code":0,"msg":"SUCCESS"})");
+                string upsert_blob = "INSERT INTO tbl_blob (hashcode, size, refcnt) VALUES ("
+                    + sql_quote(hashcode) + ", " + size_s + ", 1) "
+                    "ON DUPLICATE KEY UPDATE refcnt = refcnt + 1";
+
+                resp->MySQL(MYSQL_URL, upsert_blob,
+                    [resp, user, filename, hashcode, size_s](MySQLResultCursor* c2)
+                {
+                    if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
+                        ErrorUtil::send_error(resp, 500);
+                        return ;
+                    }
+                    string upsert_node = "INSERT INTO tbl_node "
+                        "(uid, parent_id, name, is_dir, hashcode, size) VALUES ("
+                        + std::to_string(user.id) + ", 0, " + sql_quote(filename) + ", 0, "
+                        + sql_quote(hashcode) + ", " + size_s + ") "
+                        "ON DUPLICATE KEY UPDATE hashcode = VALUES(hashcode), "
+                        "size = VALUES(size), status = 0, deleted_at = NULL";
+
+                    resp->MySQL(MYSQL_URL, upsert_node, [resp](MySQLResultCursor* c3)
+                    {
+                        if (c3->get_cursor_status() != MYSQL_STATUS_OK) {
+                            ErrorUtil::send_error(resp, 500);
+                            return ;
+                        }
+                        // 覆盖上传时旧内容的 refcnt 已减到 0, 顺手清掉它的池行
+                        sweep_unreferenced_blobs();
+                        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+                    });
+                });
             });
         }
     });
@@ -509,12 +560,11 @@ void CloudiskServer::register_filelist_module()
             ErrorUtil::send_error(resp, 401);
             return ;
         }
-        // TODO: 3. 构建SQL: SELECT filename, hashcode, size, created_at, last_update
-        //          FROM tbl_file WHERE uid=<user.id> LIMIT <limit>
-        //          通过 resp->MySQL(MYSQL_URL, sql, 回调) 执行，
-        //          回调用 std::bind 绑定 filelist_callback(resp, _1)
-        string sql = "SELECT id, filename, hashcode, size, created_at, last_update FROM tbl_file WHERE uid="
-        + std::to_string(user.id)+ " AND status = 0 LIMIT " + limit;
+        // 用别名保持列顺序不变, filelist_callback 的取字段下标无需改动。
+        // is_dir = 0 只列文件 —— 目录导航是后续的独立改造。
+        string sql = "SELECT id, name AS filename, hashcode, size, created_at, updated_at AS last_update "
+            "FROM tbl_node WHERE uid=" + std::to_string(user.id)
+            + " AND is_dir = 0 AND status = 0 LIMIT " + limit;
 
         std::cout << "[SQL] " << sql << endl;
 
@@ -581,9 +631,9 @@ void CloudiskServer::register_filedownload_module()
 #endif
         // 下载前查库: 确认该文件属于当前用户且未被软删 (status=0)，否则 404
         // 注意: escape_string_quote 只转义不加引号，外层单引号需自己补
-        string sql = "SELECT filename FROM tbl_file WHERE uid = " + std::to_string(user.id)
-            + " AND filename = '" + MySQLUtil::escape_string_quote(filename, '\'') + "'"
-            + " AND status = 0";
+        string sql = "SELECT name FROM tbl_node WHERE uid = " + std::to_string(user.id)
+            + " AND name = '" + MySQLUtil::escape_string_quote(filename, '\'') + "'"
+            + " AND is_dir = 0 AND status = 0";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(download_callback, resp, filepath, filename, _1));
     });
@@ -606,7 +656,7 @@ void delete_callback(HttpResp* resp, string id_str, int uid, MySQLResultCursor* 
     }
 
     // 软删: 只改 status 并记录删除时间，行和物理文件都保留，可进回收站、可恢复
-    string sql = "UPDATE tbl_file SET status = 1, deleted_at = NOW() WHERE id = " + id_str
+    string sql = "UPDATE tbl_node SET status = 1, deleted_at = NOW() WHERE id = " + id_str
         + " AND uid = " + std::to_string(uid);
 
     resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
@@ -639,7 +689,7 @@ void CloudiskServer::register_filedelete_module()
         }
 
         // 先查文件名(校验归属 uid + 未删除 status=0)，拿不到就 404
-        string sql = "SELECT filename FROM tbl_file WHERE id = " + id_str
+        string sql = "SELECT name FROM tbl_node WHERE id = " + id_str
             + " AND uid = " + std::to_string(user.id) + " AND status = 0";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(delete_callback, resp, id_str, user.id, _1));
@@ -662,7 +712,7 @@ void restore_callback(HttpResp* resp, string id_str, int uid, MySQLResultCursor*
         return;
     }
 
-    string sql = "UPDATE tbl_file SET status = 0, deleted_at = NULL WHERE id = " + id_str
+    string sql = "UPDATE tbl_node SET status = 0, deleted_at = NULL WHERE id = " + id_str
         + " AND uid = " + std::to_string(uid);
 
     resp->MySQL(MYSQL_URL, sql, [resp](MySQLResultCursor* cursor)
@@ -688,22 +738,48 @@ void purge_callback(HttpResp* resp, string directory, string id_str, int uid, My
         return;
     }
     string filename = record[0].as_string();
+    string hashcode = record[1].as_string();
     string filepath = directory + PathUtil::base(filename);
 
-    string sql = "DELETE FROM tbl_file WHERE id = " + id_str
+    string sql = "DELETE FROM tbl_node WHERE id = " + id_str
         + " AND uid = " + std::to_string(uid);
 
-    resp->MySQL(MYSQL_URL, sql, [resp, filepath](MySQLResultCursor* cursor)
+    resp->MySQL(MYSQL_URL, sql, [resp, filepath, hashcode](MySQLResultCursor* cursor)
     {
         if (cursor->get_cursor_status() != MYSQL_STATUS_OK) {
             ErrorUtil::send_error(resp, 500);
             return;
         }
-        // 删行成功后尽力删物理文件: 失败只留下孤儿文件(无害)，不阻断响应
-        if (unlink(filepath.c_str()) != 0) {
-            std::cout << "[WARN] 物理文件删除失败: " << filepath << endl;
-        }
-        resp->String(R"({"code":0,"msg":"SUCCESS"})");
+        // 节点已删除 -> 递减内容池引用。
+        // (物理文件仍按节点路径删, 因为暂未做内容寻址; 等物理存储改成 blobs/<hash>
+        //  之后, unlink 必须改成「refcnt 归零才删」)
+        string unref = "UPDATE tbl_blob SET refcnt = refcnt - 1 WHERE hashcode = "
+            + sql_quote(hashcode);
+
+        resp->MySQL(MYSQL_URL, unref, [resp, filepath, hashcode](MySQLResultCursor* c2)
+        {
+            if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
+                ErrorUtil::send_error(resp, 500);
+                return;
+            }
+            // refcnt 归零才清掉 blob 行
+            string clean = "DELETE FROM tbl_blob WHERE hashcode = " + sql_quote(hashcode)
+                + " AND refcnt <= 0";
+
+            resp->MySQL(MYSQL_URL, clean, [resp, filepath](MySQLResultCursor* c3)
+            {
+                if (c3->get_cursor_status() != MYSQL_STATUS_OK) {
+                    ErrorUtil::send_error(resp, 500);
+                    return;
+                }
+                // 删行成功后尽力删物理文件: 失败只留下孤儿文件(无害)，不阻断响应
+                if (unlink(filepath.c_str()) != 0) {
+                    std::cout << "[WARN] 物理文件删除失败: " << filepath << endl;
+                }
+                sweep_unreferenced_blobs();
+                resp->String(R"({"code":0,"msg":"SUCCESS"})");
+            });
+        });
     });
 }
 
@@ -738,8 +814,8 @@ void CloudiskServer::register_recycle_module()
             ErrorUtil::send_error(resp, 401);
             return;
         }
-        string sql = "SELECT id, filename, size, deleted_at FROM tbl_file WHERE uid = "
-            + std::to_string(user.id) + " AND status = 1";
+        string sql = "SELECT id, name AS filename, size, deleted_at FROM tbl_node WHERE uid = "
+            + std::to_string(user.id) + " AND is_dir = 0 AND status = 1";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(recyclelist_callback, resp, _1));
     });
@@ -760,7 +836,7 @@ void CloudiskServer::register_recycle_module()
             return;
         }
 
-        string sql = "SELECT filename FROM tbl_file WHERE id = " + id_str
+        string sql = "SELECT name FROM tbl_node WHERE id = " + id_str
             + " AND uid = " + std::to_string(user.id) + " AND status = 1";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(restore_callback, resp, id_str, user.id, _1));
@@ -783,7 +859,8 @@ void CloudiskServer::register_recycle_module()
         }
 
         string directory = "files/" + user.username + "/";
-        string sql = "SELECT filename FROM tbl_file WHERE id = " + id_str
+        // 一并取出 hashcode —— 彻底删除时要递减内容池的引用计数
+        string sql = "SELECT name, hashcode FROM tbl_node WHERE id = " + id_str
             + " AND uid = " + std::to_string(user.id) + " AND status = 1";
 
         resp->MySQL(MYSQL_URL, sql, std::bind(purge_callback, resp, directory, id_str, user.id, _1));
@@ -798,7 +875,7 @@ void CloudiskServer::register_recycle_module()
 // 学习项目可接受；生产环境需用事务或墓碑复核规避。
 static void recycle_sweep()
 {
-    // status/deleted_at 仅存在于 tbl_file，JOIN 下无歧义，无需表别名
+    // status/deleted_at 仅存在于 tbl_node，JOIN tbl_user 时无歧义，无需表别名
     string expired_cond = "status = 1 AND deleted_at < NOW() - INTERVAL "
         + std::to_string(RECYCLE_EXPIRE_DAYS) + " DAY";
 
@@ -809,7 +886,7 @@ static void recycle_sweep()
             MySQLResultCursor cursor(task->get_resp());
             int status = cursor.get_cursor_status();
             if (status == MYSQL_STATUS_ERROR) {
-                std::cout << "[WARN] 回收站清理查询失败 (tbl_file.deleted_at 列是否已迁移?)" << endl;
+                std::cout << "[WARN] 回收站清理查询失败 (tbl_node.deleted_at 列是否已迁移?)" << endl;
                 return;
             }
             if (status != MYSQL_STATUS_GET_RESULT) return;
@@ -833,12 +910,12 @@ static void recycle_sweep()
                             std::cout << "[WARN] 回收站清理失败: " << p << endl;
                     }
                 });
-            del->get_req()->set_query("DELETE FROM tbl_file WHERE " + expired_cond);
+            del->get_req()->set_query("DELETE FROM tbl_node WHERE " + expired_cond);
             Workflow::create_series_work(del, nullptr)->start();
         });
 
     query->get_req()->set_query(
-        "SELECT u.username, f.filename FROM tbl_file f JOIN tbl_user u ON f.uid = u.id WHERE "
+        "SELECT u.username, f.name FROM tbl_node f JOIN tbl_user u ON f.uid = u.id WHERE "
         + expired_cond);
     Workflow::create_series_work(query, nullptr)->start();
 }
@@ -861,8 +938,7 @@ void CloudiskServer::start_recycle_sweep()
  *                          分片上传 / 断点续传                                    *
  *********************************************************************************/
 // Redis 地址从 Redis.env 读取 (参照 OSS.env 的做法)。
-// 容器化部署时地址会变, 做成配置可避免改代码 —— consul2 曾因 IP 重分配
-// 导致整个集群丢 leader, 排查很久。
+
 static const string& redis_url()
 {
     static const string url = []() -> string
@@ -915,7 +991,6 @@ static string chunk_dir(int uid, const string& upload_id)
 }
 
 // 递归创建目录。
-// mkdir(2) 不创建父目录 —— 这个坑在 files/ 上踩过一次, 加 uid 一级后又踩一次,
 // 所以这里统一用递归版本, 以后路径再加层级也不会出问题。
 static bool ensure_dir(const string& path)
 {
@@ -1196,8 +1271,7 @@ void CloudiskServer::register_chunkupload_module()
 
             // ---- 合并: 顺序读分片追加写最终文件, 同时增量算 hash ----
             // 内存恒定 64KB, 与文件大小无关 —— 这是「分片」真正换来的东西。
-            // (注: 这里是同步磁盘 IO, 会占用 handler 线程; 与现有上传接口的
-            //  write 一致, 学习阶段可接受, 生产可改用 WFFileIOTask)
+
             EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
             EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL);
 
@@ -1249,16 +1323,47 @@ void CloudiskServer::register_chunkupload_module()
                 return ;
             }
 
-            // ---- 落库 ----
-            string sql = "REPLACE INTO tbl_file (uid, filename, hashcode, size) VALUES ("
-                + std::to_string(user.id) + ", "
-                + sql_quote(PathUtil::base(filename)) + ", "
-                + sql_quote(hashcode) + ", "
-                + std::to_string(merged) + ")";
+            // ---- 落库: 与整文件上传同样的三步, 顺序不能颠倒 ----
+            string base_name = PathUtil::base(filename);
+            string merged_s  = std::to_string(merged);
 
-            resp->MySQL(MYSQL_URL, sql, [resp, upload_id, user, filepath, hashcode, merged]
-                (MySQLResultCursor* c2)
+            string unref_old = "UPDATE tbl_blob b JOIN tbl_node n ON n.hashcode = b.hashcode "
+                "SET b.refcnt = b.refcnt - 1 "
+                "WHERE n.uid = " + std::to_string(user.id)
+                + " AND n.parent_id = 0 AND n.is_dir = 0 AND n.name = " + sql_quote(base_name)
+                + " AND n.hashcode <> " + sql_quote(hashcode);
+
+            resp->MySQL(MYSQL_URL, unref_old,
+                [resp, upload_id, user, filepath, hashcode, base_name, merged_s, merged]
+                (MySQLResultCursor* c0)
             {
+              if (c0->get_cursor_status() != MYSQL_STATUS_OK) {
+                  ErrorUtil::send_error(resp, 500);
+                  return ;
+              }
+              string upsert_blob = "INSERT INTO tbl_blob (hashcode, size, refcnt) VALUES ("
+                  + sql_quote(hashcode) + ", " + merged_s + ", 1) "
+                  "ON DUPLICATE KEY UPDATE refcnt = refcnt + 1";
+
+              resp->MySQL(MYSQL_URL, upsert_blob,
+                [resp, upload_id, user, filepath, hashcode, base_name, merged_s, merged]
+                (MySQLResultCursor* c1)
+              {
+                if (c1->get_cursor_status() != MYSQL_STATUS_OK) {
+                    ErrorUtil::send_error(resp, 500);
+                    return ;
+                }
+                string upsert_node = "INSERT INTO tbl_node "
+                    "(uid, parent_id, name, is_dir, hashcode, size) VALUES ("
+                    + std::to_string(user.id) + ", 0, " + sql_quote(base_name) + ", 0, "
+                    + sql_quote(hashcode) + ", " + merged_s + ") "
+                    "ON DUPLICATE KEY UPDATE hashcode = VALUES(hashcode), "
+                    "size = VALUES(size), status = 0, deleted_at = NULL";
+
+                resp->MySQL(MYSQL_URL, upsert_node,
+                    [resp, upload_id, user, filepath, hashcode, merged]
+                    (MySQLResultCursor* c2)
+                {
                 if (c2->get_cursor_status() != MYSQL_STATUS_OK) {
                     ErrorUtil::send_error(resp, 500);
                     return ;
@@ -1293,7 +1398,9 @@ void CloudiskServer::register_chunkupload_module()
                             resp->String(R"({"code":0,"msg":"SUCCESS"})");
                         });
                     });
-            });
+                });          // ← upsert_node 回调
+              });            // ← upsert_blob 回调
+            });              // ← unref_old 回调
         });
     });
 }
